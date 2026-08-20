@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import matplotlib
+from openpyxl import load_workbook
 from scipy.io import savemat
 
 matplotlib.use("Agg")
@@ -13,14 +14,18 @@ matplotlib.use("Agg")
 from udeco_analysis import (
     AnalysisConfig,
     PYDISPLAY_SENSOR_COLUMNS,
+    analyze_all_subjects,
     analyze_sample,
+    analyze_subject,
     classify_udeco,
     detect_motion_stage,
     discover_subject_samples,
+    export_excel,
     load_calibration,
     load_udeco_sample,
     plot_validation,
     robust_sigma,
+    summarize_subject,
 )
 
 
@@ -249,3 +254,89 @@ def test_analyze_sample_keeps_udeco_channels_independent_and_plots(tmp_path: Pat
     assert "H" not in result["channels"]["Udeco3"]["labels"]
     assert len(main_fig.axes) == 2
     assert len(debug_fig.axes) == 8
+
+
+def test_analyze_subject_keeps_bad_sample_as_error_rows(tmp_path: Path) -> None:
+    subject_dir = tmp_path / "ts"
+    subject_dir.mkdir()
+    write_calibration(tmp_path)
+    good_sensor = subject_dir / "ts_write_1_sensor.csv"
+    write_sensor(good_sensor, n=500)
+    write_hr(subject_dir / "ts_write_1_HRdata.csv")
+    bad_sensor = subject_dir / "ts_run_2_sensor.csv"
+    pd.DataFrame({"wrong": [1, 2]}).to_csv(bad_sensor, index=False)
+    write_hr(subject_dir / "ts_run_2_HRdata.csv")
+
+    result = analyze_subject(tmp_path, "ts", config=AnalysisConfig(initial_m_sec=1.0))
+
+    rows = result["sample_results"]
+    assert len(rows) == 4
+    assert set(rows.loc[rows["sample_name"] == "ts_write_1", "analysis_status"]) == {"ok"}
+    bad = rows.loc[rows["sample_name"] == "ts_run_2"]
+    assert set(bad["channel"]) == {"Udeco2", "Udeco3"}
+    assert set(bad["analysis_status"]) == {"error"}
+    assert bad["H_mean"].isna().all()
+    assert "analysis_error" in set(result["qc"]["category"])
+
+
+def test_subject_summary_ignores_nan_and_counts_valid_samples() -> None:
+    sample_results = pd.DataFrame(
+        [
+            {"sample_name": "a", "subject": "ts", "channel": "Udeco2", "analysis_status": "ok", "H_mean": 1.0, "M_mean": 0.0, "L_mean": np.nan},
+            {"sample_name": "b", "subject": "ts", "channel": "Udeco2", "analysis_status": "ok", "H_mean": 3.0, "M_mean": 0.2, "L_mean": np.nan},
+            {"sample_name": "c", "subject": "ts", "channel": "Udeco2", "analysis_status": "error", "H_mean": 99.0, "M_mean": 99.0, "L_mean": -99.0},
+            {"sample_name": "a", "subject": "ts", "channel": "Udeco3", "analysis_status": "ok", "H_mean": np.nan, "M_mean": 2.0, "L_mean": -1.0},
+        ]
+    )
+
+    summary = summarize_subject(sample_results)
+    h2 = summary.loc[(summary["channel"] == "Udeco2") & (summary["state"] == "H")].iloc[0]
+    l2 = summary.loc[(summary["channel"] == "Udeco2") & (summary["state"] == "L")].iloc[0]
+
+    assert h2["mean"] == pytest.approx(2.0)
+    assert h2["std"] == pytest.approx(np.sqrt(2.0))
+    assert h2["N"] == 2
+    assert l2["N"] == 0
+    assert np.isnan(l2["mean"])
+
+
+def test_export_excel_writes_six_subject_sheets_and_three_parts(tmp_path: Path) -> None:
+    subjects = ["ts", "lyx", "lzj", "cgx", "pjy", "hjy"]
+    rows = pd.DataFrame(
+        [
+            {
+                "sample_name": "ts_write_1",
+                "subject": "ts",
+                "motion_type": "write",
+                "motion_index": 1,
+                "channel": channel,
+                "analysis_status": "ok",
+                "H_mean": 1.0 if channel == "Udeco2" else np.nan,
+                "M_mean": 0.0,
+                "L_mean": np.nan,
+                "QC_flag": "OK",
+            }
+            for channel in ("Udeco2", "Udeco3")
+        ]
+    )
+    batch = {}
+    for subject in subjects:
+        frame = rows.copy() if subject == "ts" else rows.iloc[0:0].copy()
+        batch[subject] = {
+            "subject": subject,
+            "sample_results": frame,
+            "summary": summarize_subject(frame),
+            "qc": pd.DataFrame(columns=["file_name", "category", "reason"]),
+            "sample_details": {},
+        }
+    output = tmp_path / "udeco_results.xlsx"
+
+    written = export_excel(batch, output)
+
+    assert written == output
+    workbook = load_workbook(output, data_only=True)
+    assert workbook.sheetnames == subjects
+    values = [cell.value for row in workbook["ts"].iter_rows() for cell in row]
+    assert "Part A: Sample-level results" in values
+    assert "Part B: Subject summary" in values
+    assert "Part C: Skipped files / QC" in values

@@ -723,6 +723,163 @@ def analyze_sample(
     }
 
 
+def analyze_subject(
+    data_root: str | Path,
+    subject: str,
+    *,
+    fs: int = FS_HZ,
+    config: AnalysisConfig | None = None,
+) -> dict[str, Any]:
+    """分析一个受试者的全部严格配对样本；单样本错误不终止批次。"""
+
+    config = config or AnalysisConfig()
+    pairs, discovery_issues = discover_subject_samples(data_root, subject)
+    result_rows: list[dict[str, Any]] = []
+    qc_rows = [
+        {
+            "sample_name": "",
+            "file_name": issue.file_name,
+            "category": issue.category,
+            "reason": issue.reason,
+        }
+        for issue in discovery_issues
+    ]
+    sample_details: dict[str, dict[str, Any]] = {}
+    for pair in pairs:
+        try:
+            sample_result = analyze_sample(pair.sensor_csv, data_root=data_root, fs=fs, config=config)
+            sample_details[pair.sample_name] = sample_result
+            for channel_name, channel_result in sample_result["channels"].items():
+                row = dict(channel_result["statistics"])
+                row.update({"motion_type": pair.motion_type, "motion_index": pair.motion_index})
+                result_rows.append(row)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            qc_rows.append(
+                {
+                    "sample_name": pair.sample_name,
+                    "file_name": pair.sensor_csv.name,
+                    "category": "analysis_error",
+                    "reason": message,
+                }
+            )
+            for channel_name in ("Udeco2", "Udeco3"):
+                result_rows.append(
+                    _error_statistics_row(
+                        sample_name=pair.sample_name,
+                        subject=subject,
+                        channel=channel_name,
+                        motion_type=pair.motion_type,
+                        motion_index=pair.motion_index,
+                        message=message,
+                    )
+                )
+    sample_results = pd.DataFrame(result_rows, columns=_sample_result_columns())
+    qc = pd.DataFrame(qc_rows, columns=["sample_name", "file_name", "category", "reason"])
+    return {
+        "subject": subject,
+        "sample_results": sample_results,
+        "summary": summarize_subject(sample_results),
+        "qc": qc,
+        "sample_details": sample_details,
+    }
+
+
+def analyze_all_subjects(
+    data_root: str | Path,
+    subjects: list[str] | tuple[str, ...],
+    *,
+    fs: int = FS_HZ,
+    config: AnalysisConfig | None = None,
+) -> dict[str, dict[str, Any]]:
+    """依次运行全部受试者，并为缺失目录保留受试者级 QC。"""
+
+    config = config or AnalysisConfig()
+    batch: dict[str, dict[str, Any]] = {}
+    for subject in subjects:
+        try:
+            batch[subject] = analyze_subject(data_root, subject, fs=fs, config=config)
+        except Exception as exc:
+            empty = pd.DataFrame(columns=_sample_result_columns())
+            batch[subject] = {
+                "subject": subject,
+                "sample_results": empty,
+                "summary": summarize_subject(empty),
+                "qc": pd.DataFrame(
+                    [
+                        {
+                            "sample_name": "",
+                            "file_name": "",
+                            "category": "subject_error",
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        }
+                    ]
+                ),
+                "sample_details": {},
+            }
+    return batch
+
+
+def summarize_subject(sample_results: pd.DataFrame) -> pd.DataFrame:
+    """汇总各通道 H/M/L 样本均值的跨样本 mean、std 和有效 N。"""
+
+    columns = ["channel", "state", "mean", "std", "N", "mean_std"]
+    records: list[dict[str, Any]] = []
+    frame = sample_results.copy()
+    if "analysis_status" in frame.columns:
+        frame = frame.loc[frame["analysis_status"] == "ok"]
+    for channel in ("Udeco2", "Udeco3"):
+        channel_frame = frame.loc[frame.get("channel", pd.Series(dtype=object)) == channel]
+        for state in ("H", "M", "L"):
+            source = channel_frame.get(f"{state}_mean", pd.Series(dtype=float))
+            values = pd.to_numeric(source, errors="coerce").dropna()
+            count = int(values.size)
+            mean = float(values.mean()) if count else float("nan")
+            std = float(values.std(ddof=1)) if count >= 2 else float("nan")
+            formatted = f"{mean:.6g} ± {std:.6g}" if count >= 2 else f"{mean:.6g}" if count == 1 else "NaN"
+            records.append(
+                {"channel": channel, "state": state, "mean": mean, "std": std, "N": count, "mean_std": formatted}
+            )
+    return pd.DataFrame.from_records(records, columns=columns)
+
+
+def export_excel(batch_results: dict[str, dict[str, Any]], output_path: str | Path) -> Path:
+    """把每个受试者的样本、汇总和 QC 写入独立 Excel sheet。"""
+
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for subject, result in batch_results.items():
+            sheet_name = _safe_sheet_name(subject)
+            wide = _wide_sample_results(result["sample_results"])
+            summary = result.get("summary", summarize_subject(result["sample_results"]))
+            qc = result.get("qc", pd.DataFrame(columns=["sample_name", "file_name", "category", "reason"]))
+            part_a_row = 1
+            table_a_row = 3
+            wide.to_excel(writer, sheet_name=sheet_name, startrow=table_a_row - 1, index=False)
+            part_b_row = table_a_row + len(wide) + 3
+            summary.to_excel(writer, sheet_name=sheet_name, startrow=part_b_row + 1, index=False)
+            part_c_row = part_b_row + len(summary) + 5
+            qc.to_excel(writer, sheet_name=sheet_name, startrow=part_c_row + 1, index=False)
+            worksheet = writer.book[sheet_name]
+            worksheet.cell(part_a_row, 1, "Part A: Sample-level results")
+            worksheet.cell(part_b_row + 1, 1, "Part B: Subject summary")
+            worksheet.cell(part_c_row + 1, 1, "Part C: Skipped files / QC")
+            title_fill = PatternFill("solid", fgColor="D9EAF7")
+            for row in (part_a_row, part_b_row + 1, part_c_row + 1):
+                worksheet.cell(row, 1).font = Font(bold=True)
+                worksheet.cell(row, 1).fill = title_fill
+            worksheet.freeze_panes = "A4"
+            for column_cells in worksheet.columns:
+                values = [str(cell.value) for cell in column_cells if cell.value is not None]
+                width = min(45, max([len(value) for value in values], default=8) + 2)
+                worksheet.column_dimensions[get_column_letter(column_cells[0].column)].width = width
+    return output
+
+
 def plot_validation(
     sample_result: dict[str, Any],
     *,
@@ -874,6 +1031,87 @@ def _contiguous_label_runs(time: np.ndarray, labels: np.ndarray, fs: int) -> lis
         )
         for start, end in zip(boundaries[:-1], boundaries[1:])
     ]
+
+
+def _sample_result_columns() -> list[str]:
+    return [
+        "sample_name",
+        "subject",
+        "motion_type",
+        "motion_index",
+        "channel",
+        "analysis_status",
+        "error_message",
+        "n_detected_states",
+        "H_mean",
+        "H_std",
+        "M_mean",
+        "M_std",
+        "L_mean",
+        "L_std",
+        "H_total_duration",
+        "M_total_duration",
+        "L_total_duration",
+        "transition_count",
+        "M0",
+        "sigma0",
+        "sigma_M",
+        "state_separation",
+        "motion_start_s",
+        "motion_end_s",
+        "QC_flag",
+    ]
+
+
+def _error_statistics_row(
+    *,
+    sample_name: str,
+    subject: str,
+    channel: str,
+    motion_type: str,
+    motion_index: int,
+    message: str,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {column: float("nan") for column in _sample_result_columns()}
+    row.update(
+        {
+            "sample_name": sample_name,
+            "subject": subject,
+            "motion_type": motion_type,
+            "motion_index": int(motion_index),
+            "channel": channel,
+            "analysis_status": "error",
+            "error_message": message,
+            "QC_flag": "analysis_error",
+        }
+    )
+    return row
+
+
+def _wide_sample_results(sample_results: pd.DataFrame) -> pd.DataFrame:
+    """将内部 sample×channel 长表转换为每个样本一行的 Excel 宽表。"""
+
+    base_columns = ["sample_name", "subject", "motion_type", "motion_index"]
+    if sample_results.empty:
+        return pd.DataFrame(columns=base_columns)
+    records: list[dict[str, Any]] = []
+    for sample_name, group in sample_results.groupby("sample_name", sort=False, dropna=False):
+        first = group.iloc[0]
+        record = {column: first.get(column, "") for column in base_columns}
+        record["sample_name"] = sample_name
+        for _, row in group.iterrows():
+            channel = str(row["channel"])
+            for column in _sample_result_columns():
+                if column not in {*base_columns, "channel"}:
+                    record[f"{channel}_{column}"] = row.get(column, np.nan)
+        records.append(record)
+    return pd.DataFrame.from_records(records)
+
+
+def _safe_sheet_name(subject: str) -> str:
+    invalid = set('[]:*?/\\')
+    cleaned = "".join("_" if char in invalid else char for char in str(subject)).strip()
+    return (cleaned or "subject")[:31]
 
 
 def _state_statistics(
