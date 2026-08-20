@@ -5,15 +5,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import matplotlib
 from scipy.io import savemat
+
+matplotlib.use("Agg")
 
 from udeco_analysis import (
     AnalysisConfig,
     PYDISPLAY_SENSOR_COLUMNS,
+    analyze_sample,
     classify_udeco,
+    detect_motion_stage,
     discover_subject_samples,
     load_calibration,
     load_udeco_sample,
+    plot_validation,
     robust_sigma,
 )
 
@@ -198,3 +204,48 @@ def test_three_states_and_direct_h_l_transition_are_retained_and_flagged() -> No
     assert "direct_H_to_L" in result["statistics"]["QC_flag"]
     assert result["statistics"]["transition_count"] >= 3
     assert len(result["change_points"]) >= 3
+
+
+def test_motion_detection_finds_rest_motion_recovery() -> None:
+    fs = 100
+    time = np.arange(3000, dtype=float) / fs
+    rng = np.random.default_rng(12)
+    accx = rng.normal(0.0, 0.01, time.size)
+    accy = rng.normal(0.0, 0.01, time.size)
+    accz = rng.normal(0.0, 0.01, time.size)
+    motion = (time >= 10.0) & (time < 20.0)
+    accx[motion] += np.sin(2 * np.pi * 2.0 * time[motion])
+    config = AnalysisConfig(
+        motion_calibration_sec=5.0,
+        motion_window_sec=1.0,
+        motion_transition_windows=2,
+    )
+
+    result = detect_motion_stage(accx, accy, accz, fs=fs, config=config)
+
+    assert result["status"] == "ok"
+    assert result["motion_start_s"] == pytest.approx(10.0, abs=1.0)
+    assert result["motion_end_s"] == pytest.approx(20.0, abs=1.0)
+
+
+def test_analyze_sample_keeps_udeco_channels_independent_and_plots(tmp_path: Path) -> None:
+    subject_dir = tmp_path / "ts"
+    subject_dir.mkdir()
+    write_calibration(tmp_path)
+    sensor = subject_dir / "ts_write_1_sensor.csv"
+    write_sensor(sensor, n=500)
+    frame = pd.read_csv(sensor)
+    frame.loc[200:209, "Uh2"] += 1.5
+    frame.loc[300:319, "Uh3"] -= 2.0
+    frame.to_csv(sensor, index=False)
+
+    result = analyze_sample(sensor, data_root=tmp_path, config=AnalysisConfig(initial_m_sec=1.0))
+    main_fig, debug_fig = plot_validation(result, show_debug_info=True)
+
+    assert set(result["channels"]) == {"Udeco2", "Udeco3"}
+    assert "H" in result["channels"]["Udeco2"]["labels"]
+    assert "L" not in result["channels"]["Udeco2"]["labels"]
+    assert "L" in result["channels"]["Udeco3"]["labels"]
+    assert "H" not in result["channels"]["Udeco3"]["labels"]
+    assert len(main_fig.axes) == 2
+    assert len(debug_fig.axes) == 8

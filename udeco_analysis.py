@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy.io import loadmat
 from scipy.ndimage import median_filter
-from scipy.signal import find_peaks
+from scipy.signal import butter, filtfilt, find_peaks
 
 
 FS_HZ = 100
@@ -601,6 +601,7 @@ def classify_udeco(
         "statistics": statistics,
         "debug": {
             "change_score": score,
+            "change_threshold_sigma": config.change_threshold_sigma,
             "sigma_m": sigma_m,
             "enter_threshold": config.enter_sigma * sigma_m,
             "exit_threshold": config.exit_sigma * sigma_m,
@@ -608,6 +609,271 @@ def classify_udeco(
             "trusted_m_mask": trusted_mask,
         },
     }
+
+
+def detect_motion_stage(
+    accx: np.ndarray,
+    accy: np.ndarray,
+    accz: np.ndarray,
+    *,
+    fs: int = FS_HZ,
+    config: AnalysisConfig | None = None,
+) -> dict[str, Any]:
+    """沿用参考仓库的 ACC 合模长 STD 规则识别运动起止。"""
+
+    config = config or AnalysisConfig()
+    axes = [_safe_bandpass(np.asarray(axis, dtype=float), fs, 0.5, 10.0) for axis in (accx, accy, accz)]
+    if len({axis.size for axis in axes}) != 1 or axes[0].size == 0:
+        return _motion_error("ACC channels must have equal non-zero length")
+    magnitude = np.sqrt(sum(axis**2 for axis in axes))
+    calibration_n = min(magnitude.size, int(round(config.motion_calibration_sec * fs)))
+    if calibration_n < 2:
+        return _motion_error("not enough samples for motion calibration")
+    baseline_std = float(np.std(magnitude[:calibration_n], ddof=1))
+    threshold = config.motion_threshold_sigma * max(baseline_std, config.epsilon)
+    window_n = max(2, int(round(config.motion_window_sec * fs)))
+    step_n = max(1, int(round(config.motion_step_sec * fs)))
+    if magnitude.size < window_n:
+        return _motion_error("signal shorter than one motion window", threshold=threshold)
+    starts = np.arange(0, magnitude.size - window_n + 1, step_n, dtype=int)
+    window_std = np.asarray(
+        [np.std(magnitude[start : start + window_n], ddof=1) for start in starts],
+        dtype=float,
+    )
+    flags = window_std > threshold
+    run = int(config.motion_transition_windows)
+    start_index = _find_boolean_transition(flags, before=False, after=True, run=run, start_at=0)
+    if start_index is None:
+        return _motion_error(
+            f"cannot find {run} rest windows followed by {run} motion windows",
+            threshold=threshold,
+            starts=starts / fs,
+            window_std=window_std,
+            flags=flags,
+        )
+    end_index = _find_boolean_transition(flags, before=True, after=False, run=run, start_at=start_index)
+    if end_index is None:
+        return _motion_error(
+            f"cannot find {run} motion windows followed by {run} rest windows",
+            threshold=threshold,
+            starts=starts / fs,
+            window_std=window_std,
+            flags=flags,
+        )
+    return {
+        "status": "ok",
+        "reason": "",
+        "motion_start_s": float(starts[start_index] / fs),
+        "motion_end_s": float(starts[end_index] / fs),
+        "motion_threshold": float(threshold),
+        "window_starts_s": starts.astype(float) / fs,
+        "window_centers_s": starts.astype(float) / fs + config.motion_window_sec / 2.0,
+        "window_std": window_std,
+        "motion_flags": flags,
+    }
+
+
+def analyze_sample(
+    sensor_csv: str | Path,
+    *,
+    data_root: str | Path,
+    fs: int = FS_HZ,
+    config: AnalysisConfig | None = None,
+) -> dict[str, Any]:
+    """读取一个文件，并让 Udeco2/Udeco3 独立执行同一分类函数。"""
+
+    config = config or AnalysisConfig()
+    loaded = load_udeco_sample(sensor_csv, data_root=data_root, fs=fs, epsilon=config.epsilon)
+    motion = detect_motion_stage(loaded.accx, loaded.accy, loaded.accz, fs=loaded.fs, config=config)
+    channels: dict[str, dict[str, Any]] = {}
+    for name, values in (("Udeco2", loaded.udeco2), ("Udeco3", loaded.udeco3)):
+        channel_result = classify_udeco(values, time=loaded.time_s, fs=loaded.fs, config=config)
+        statistics = channel_result["statistics"]
+        statistics.update(
+            {
+                "sample_name": loaded.sample_name,
+                "subject": loaded.subject,
+                "channel": name,
+                "analysis_status": "ok",
+                "error_message": "",
+                "motion_start_s": motion["motion_start_s"],
+                "motion_end_s": motion["motion_end_s"],
+            }
+        )
+        extra_qc: list[str] = []
+        if int(loaded.qc["ud_denominator_near_zero"].sum()) > 0:
+            extra_qc.append("ud_denominator_near_zero")
+        if int(loaded.qc["InterpFlag"].sum()) > 0:
+            extra_qc.append("sequence_interpolated")
+        if motion["status"] != "ok":
+            extra_qc.append("motion_detection_failed")
+        current_qc = [] if statistics["QC_flag"] == "OK" else statistics["QC_flag"].split(";")
+        combined = list(dict.fromkeys([*current_qc, *extra_qc]))
+        statistics["QC_flag"] = ";".join(combined) if combined else "OK"
+        channels[name] = channel_result
+    return {
+        "sample_name": loaded.sample_name,
+        "subject": loaded.subject,
+        "fs": loaded.fs,
+        "time": loaded.time_s,
+        "channels": channels,
+        "motion": motion,
+        "input_qc": loaded.qc,
+        "metadata": loaded.metadata,
+    }
+
+
+def plot_validation(
+    sample_result: dict[str, Any],
+    *,
+    show_debug_info: bool = True,
+) -> tuple[Any, Any | None]:
+    """绘制固定两行主验证图，并可选返回 4×2 调试图。"""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    colors = {"H": "#E76F51", "M": "#2A9D8F", "L": "#457B9D"}
+    channel_names = ("Udeco2", "Udeco3")
+    main_fig, main_axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True, constrained_layout=True)
+    motion = sample_result["motion"]
+    for axis, channel_name in zip(main_axes, channel_names):
+        result = sample_result["channels"][channel_name]
+        time = result["time"]
+        for start, end, label in _contiguous_label_runs(time, result["labels"], sample_result["fs"]):
+            axis.axvspan(start, end, color=colors[label], alpha=0.16, zorder=0)
+        axis.plot(time, result["raw"], color="black", linewidth=0.8, label="Raw Udeco", zorder=4)
+        axis.plot(time, result["M_t"], color="#264653", linewidth=1.2, linestyle="--", label="M(t)", zorder=3)
+        enter = float(result["debug"]["enter_threshold"])
+        axis.plot(time, result["M_t"] + enter, color="#E76F51", linewidth=0.7, linestyle=":", alpha=0.8)
+        axis.plot(time, result["M_t"] - enter, color="#457B9D", linewidth=0.7, linestyle=":", alpha=0.8)
+        for point in result["change_points"]:
+            axis.axvline(time[int(point)], color="#6C757D", linewidth=0.5, alpha=0.5, zorder=1)
+        if motion["status"] == "ok":
+            axis.axvline(motion["motion_start_s"], color="#F4A261", linestyle="--", linewidth=1.1)
+            axis.axvline(motion["motion_end_s"], color="#F4A261", linestyle="--", linewidth=1.1)
+        axis.set_ylabel(channel_name)
+        axis.grid(alpha=0.15)
+        handles = [
+            Line2D([0], [0], color="black", linewidth=1.0, label="Raw Udeco"),
+            Line2D([0], [0], color="#264653", linestyle="--", label="M(t)"),
+            *[Patch(facecolor=colors[state], alpha=0.22, label=state) for state in ("H", "M", "L")],
+        ]
+        axis.legend(handles=handles, loc="upper right", ncol=5)
+    main_axes[-1].set_xlabel("Time / s")
+    main_fig.suptitle(f"{sample_result['sample_name']} | Udeco state validation")
+
+    if not show_debug_info:
+        return main_fig, None
+    debug_fig, debug_axes = plt.subplots(4, 2, figsize=(16, 11), sharex="col", constrained_layout=True)
+    for column, channel_name in enumerate(channel_names):
+        result = sample_result["channels"][channel_name]
+        time = result["time"]
+        debug_axes[0, column].plot(time, result["filtered"], color="#333333", linewidth=0.8, label="Filtered")
+        debug_axes[0, column].plot(time, result["M_t"], color="#2A9D8F", linestyle="--", label="M(t)")
+        for point in result["change_points"]:
+            debug_axes[0, column].axvline(time[int(point)], color="#E9C46A", linewidth=0.6)
+        debug_axes[0, column].legend(loc="upper right")
+        debug_axes[0, column].set_title(channel_name)
+        debug_axes[1, column].plot(time, result["debug"]["change_score"], color="#6D597A", linewidth=0.8)
+        debug_axes[1, column].axhline(
+            result["debug"].get("change_threshold_sigma", np.nan), color="#D62828", linestyle="--"
+        )
+        debug_axes[1, column].set_ylabel("S(t)")
+        debug_axes[2, column].plot(time, result["residual"], color="#1D3557", linewidth=0.8)
+        enter = float(result["debug"]["enter_threshold"])
+        exit_threshold = float(result["debug"]["exit_threshold"])
+        for value, style in ((enter, "--"), (-enter, "--"), (exit_threshold, ":"), (-exit_threshold, ":")):
+            debug_axes[2, column].axhline(value, color="#D62828", linestyle=style, linewidth=0.7)
+        debug_axes[2, column].set_ylabel("Residual")
+        code = pd.Series(result["labels"]).map({"L": -1, "M": 0, "H": 1}).to_numpy(dtype=float)
+        debug_axes[3, column].step(time, code, where="post", color="#264653")
+        debug_axes[3, column].set_yticks([-1, 0, 1], labels=["L", "M", "H"])
+        debug_axes[3, column].set_xlabel("Time / s")
+        debug_axes[3, column].set_ylabel("Label")
+        for row in range(4):
+            debug_axes[row, column].grid(alpha=0.15)
+    debug_fig.suptitle(f"{sample_result['sample_name']} | Debug diagnostics")
+    return main_fig, debug_fig
+
+
+def _safe_bandpass(signal: np.ndarray, fs: int, low_hz: float, high_hz: float) -> np.ndarray:
+    """对 ACC 使用零相位带通；短序列安全退化为去均值。"""
+
+    arr = np.asarray(signal, dtype=float)
+    if arr.size == 0 or not np.isfinite(arr).all():
+        return arr
+    nyquist = float(fs) / 2.0
+    high = min(float(high_hz), 0.45 * float(fs))
+    low = max(float(low_hz), 1e-3)
+    if arr.size < 8 or not (0 < low < high < nyquist):
+        return arr - np.mean(arr)
+    b, a = butter(4, [low / nyquist, high / nyquist], btype="bandpass")
+    padlen = 3 * max(len(a), len(b))
+    if arr.size <= padlen:
+        return arr - np.mean(arr)
+    try:
+        return filtfilt(b, a, arr)
+    except ValueError:
+        return arr - np.mean(arr)
+
+
+def _find_boolean_transition(
+    flags: np.ndarray,
+    *,
+    before: bool,
+    after: bool,
+    run: int,
+    start_at: int,
+) -> int | None:
+    for index in range(max(0, int(start_at)), len(flags) - 2 * int(run) + 1):
+        if np.all(flags[index : index + run] == before) and np.all(
+            flags[index + run : index + 2 * run] == after
+        ):
+            return index + run
+    return None
+
+
+def _motion_error(
+    reason: str,
+    *,
+    threshold: float = float("nan"),
+    starts: np.ndarray | None = None,
+    window_std: np.ndarray | None = None,
+    flags: np.ndarray | None = None,
+) -> dict[str, Any]:
+    starts_arr = np.asarray([] if starts is None else starts, dtype=float)
+    return {
+        "status": "error",
+        "reason": reason,
+        "motion_start_s": float("nan"),
+        "motion_end_s": float("nan"),
+        "motion_threshold": float(threshold),
+        "window_starts_s": starts_arr,
+        "window_centers_s": starts_arr,
+        "window_std": np.asarray([] if window_std is None else window_std, dtype=float),
+        "motion_flags": np.asarray([] if flags is None else flags, dtype=bool),
+    }
+
+
+def _contiguous_label_runs(time: np.ndarray, labels: np.ndarray, fs: int) -> list[tuple[float, float, str]]:
+    """把样本标签压缩为绘图使用的连续时间区间。"""
+
+    time_arr = np.asarray(time, dtype=float)
+    labels_arr = np.asarray(labels, dtype=object)
+    if labels_arr.size == 0:
+        return []
+    changes = np.flatnonzero(labels_arr[1:] != labels_arr[:-1]) + 1
+    boundaries = [0, *changes.tolist(), labels_arr.size]
+    return [
+        (
+            float(time_arr[start]),
+            float(time_arr[end - 1] + 1.0 / fs),
+            str(labels_arr[start]),
+        )
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
 
 
 def _state_statistics(
