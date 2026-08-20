@@ -8,10 +8,13 @@ import pytest
 from scipy.io import savemat
 
 from udeco_analysis import (
+    AnalysisConfig,
     PYDISPLAY_SENSOR_COLUMNS,
+    classify_udeco,
     discover_subject_samples,
     load_calibration,
     load_udeco_sample,
+    robust_sigma,
 )
 
 
@@ -119,3 +122,79 @@ def test_discovery_requires_strict_sensor_hr_pairs(tmp_path: Path) -> None:
 def test_missing_calibration_is_explicit(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="ck.mat"):
         load_calibration(tmp_path)
+
+
+def test_robust_sigma_uses_epsilon_for_constant_signal() -> None:
+    assert robust_sigma(np.ones(20), epsilon=1e-7) == pytest.approx(1e-7)
+
+
+def test_classify_udeco_preserves_100_ms_h_state_and_nan_for_missing_l() -> None:
+    fs = 100
+    time = np.arange(500, dtype=float) / fs
+    rng = np.random.default_rng(7)
+    raw = rng.normal(0.0, 0.005, time.size)
+    short_h = (time >= 2.0) & (time < 2.1)
+    raw[short_h] += 0.8
+    config = AnalysisConfig(initial_m_sec=1.0)
+
+    result = classify_udeco(raw, time=time, fs=fs, config=config)
+
+    assert np.mean(result["labels"][short_h] == "H") >= 0.8
+    assert result["statistics"]["n_detected_states"] == 2
+    assert np.isnan(result["statistics"]["L_mean"])
+    assert np.isnan(result["statistics"]["L_total_duration"])
+    assert result["statistics"]["H_total_duration"] == pytest.approx(0.1)
+
+
+def test_classify_udeco_preserves_200_ms_l_state() -> None:
+    fs = 100
+    time = np.arange(500, dtype=float) / fs
+    raw = np.zeros(time.size)
+    short_l = (time >= 2.0) & (time < 2.2)
+    raw[short_l] = -0.8
+
+    result = classify_udeco(raw, time=time, fs=fs, config=AnalysisConfig(initial_m_sec=1.0))
+
+    assert np.mean(result["labels"][short_l] == "L") >= 0.9
+    assert result["statistics"]["L_total_duration"] == pytest.approx(0.2)
+
+
+def test_classify_udeco_rejects_single_sample_spike() -> None:
+    fs = 100
+    time = np.arange(500, dtype=float) / fs
+    raw = np.zeros(time.size)
+    raw[250] = 5.0
+
+    result = classify_udeco(raw, time=time, fs=fs, config=AnalysisConfig(initial_m_sec=1.0))
+
+    assert set(result["labels"]) == {"M"}
+    assert result["statistics"]["n_detected_states"] == 1
+
+
+def test_dynamic_m_tracks_slow_drift_without_false_h_or_l() -> None:
+    fs = 100
+    time = np.arange(2000, dtype=float) / fs
+    rng = np.random.default_rng(9)
+    raw = 0.01 * time + rng.normal(0.0, 0.006, time.size)
+    config = AnalysisConfig(initial_m_sec=2.0, m_baseline_smooth_sec=5.0)
+
+    result = classify_udeco(raw, time=time, fs=fs, config=config)
+
+    assert set(result["labels"]) == {"M"}
+    assert result["M_t"][-1] - result["M_t"][0] > 0.15
+
+
+def test_three_states_and_direct_h_l_transition_are_retained_and_flagged() -> None:
+    fs = 100
+    time = np.arange(500, dtype=float) / fs
+    raw = np.zeros(time.size)
+    raw[(time >= 2.0) & (time < 2.5)] = 1.0
+    raw[(time >= 2.5) & (time < 3.0)] = -1.0
+    config = AnalysisConfig(initial_m_sec=1.0)
+
+    result = classify_udeco(raw, time=time, fs=fs, config=config)
+
+    assert {"H", "M", "L"} == set(result["labels"])
+    assert "direct_H_to_L" in result["statistics"]["QC_flag"]
+    assert result["statistics"]["transition_count"] >= 3
+    assert len(result["change_points"]) >= 3

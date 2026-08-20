@@ -14,6 +14,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy.io import loadmat
+from scipy.ndimage import median_filter
+from scipy.signal import find_peaks
 
 
 FS_HZ = 100
@@ -97,6 +99,54 @@ class LoadedSample:
     accz: np.ndarray
     qc: pd.DataFrame
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AnalysisConfig:
+    """状态识别参数；所有时间参数均使用秒。"""
+
+    median_filter_sec: float = 0.03
+    initial_m_sec: float = 30.0
+    change_window_sec: float = 0.03
+    change_threshold_sigma: float = 5.0
+    change_peak_merge_sec: float = 0.04
+    min_platform_sec: float = 0.06
+    state_separation_sigma: float = 4.0
+    m_anchor_sigma: float = 2.5
+    m_baseline_smooth_sec: float = 10.0
+    m_baseline_max_iter: int = 5
+    enter_sigma: float = 4.0
+    exit_sigma: float = 2.0
+    use_gmm: bool = False
+    epsilon: float = 1e-9
+    motion_calibration_sec: float = 30.0
+    motion_window_sec: float = 8.0
+    motion_step_sec: float = 1.0
+    motion_threshold_sigma: float = 3.0
+    motion_transition_windows: int = 6
+
+    def __post_init__(self) -> None:
+        positive = {
+            "median_filter_sec": self.median_filter_sec,
+            "initial_m_sec": self.initial_m_sec,
+            "change_window_sec": self.change_window_sec,
+            "change_threshold_sigma": self.change_threshold_sigma,
+            "change_peak_merge_sec": self.change_peak_merge_sec,
+            "min_platform_sec": self.min_platform_sec,
+            "state_separation_sigma": self.state_separation_sigma,
+            "m_anchor_sigma": self.m_anchor_sigma,
+            "m_baseline_smooth_sec": self.m_baseline_smooth_sec,
+            "enter_sigma": self.enter_sigma,
+            "exit_sigma": self.exit_sigma,
+            "epsilon": self.epsilon,
+        }
+        invalid = [name for name, value in positive.items() if not np.isfinite(value) or value <= 0]
+        if invalid:
+            raise ValueError(f"Config values must be finite and positive: {', '.join(invalid)}")
+        if self.enter_sigma <= self.exit_sigma:
+            raise ValueError("enter_sigma must be greater than exit_sigma")
+        if int(self.m_baseline_max_iter) < 1:
+            raise ValueError("m_baseline_max_iter must be at least 1")
 
 
 def load_calibration(data_root: str | Path) -> Calibration:
@@ -243,6 +293,416 @@ def load_udeco_sample(
         qc=qc,
         metadata=metadata,
     )
+
+
+def robust_sigma(values: np.ndarray, *, epsilon: float = 1e-9) -> float:
+    """用 ``1.4826 × MAD`` 估计噪声尺度，并提供数值下限。"""
+
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float(epsilon)
+    center = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - center)))
+    return max(float(epsilon), 1.4826 * mad)
+
+
+def estimate_initial_m(
+    signal: np.ndarray,
+    *,
+    fs: int,
+    initial_m_sec: float,
+    epsilon: float = 1e-9,
+) -> tuple[float, float, int]:
+    """由记录开头估计 ``(M0, sigma0, 使用样本数)``。"""
+
+    arr = np.asarray(signal, dtype=float)
+    if arr.size == 0 or not np.isfinite(arr).all():
+        raise ValueError("signal must contain finite values")
+    n_initial = min(arr.size, max(1, int(round(float(initial_m_sec) * int(fs)))))
+    initial = arr[:n_initial]
+    m0 = float(np.median(initial))
+    return m0, robust_sigma(initial, epsilon=epsilon), n_initial
+
+
+def detect_change_points(
+    signal: np.ndarray,
+    *,
+    fs: int,
+    sigma0: float,
+    config: AnalysisConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """用短时左右窗口中位数差检测并合并平台变化点。"""
+
+    arr = np.asarray(signal, dtype=float)
+    n = arr.size
+    window = max(1, int(round(config.change_window_sec * int(fs))))
+    score = np.zeros(n, dtype=float)
+    scale = max(float(sigma0), config.epsilon)
+    if n < 2 * window + 1:
+        return np.asarray([], dtype=int), score
+    for index in range(window, n - window):
+        left = float(np.median(arr[index - window : index]))
+        right = float(np.median(arr[index : index + window]))
+        score[index] = abs(right - left) / scale
+    peaks, _ = find_peaks(score, height=config.change_threshold_sigma)
+    if peaks.size == 0:
+        return np.asarray([], dtype=int), score
+
+    # 将得分峰细化到局部最大相邻跃变处，使 segment 边界贴近真实阶跃。
+    refined: list[int] = []
+    local_delta = np.abs(np.diff(arr))
+    for peak in peaks:
+        lo = max(0, int(peak) - window)
+        hi = min(local_delta.size, int(peak) + window)
+        boundary = int(np.argmax(local_delta[lo:hi]) + lo + 1) if hi > lo else int(peak)
+        refined.append(boundary)
+    candidates = sorted(set(index for index in refined if 0 < index < n))
+    merge_samples = max(1, int(round(config.change_peak_merge_sec * int(fs))))
+    groups: list[list[int]] = []
+    for index in candidates:
+        if not groups or index - groups[-1][-1] > merge_samples:
+            groups.append([index])
+        else:
+            groups[-1].append(index)
+    merged = [max(group, key=lambda idx: score[min(max(idx, 0), n - 1)]) for group in groups]
+    return np.asarray(merged, dtype=int), score
+
+
+def build_segments(
+    raw: np.ndarray,
+    filtered: np.ndarray,
+    time: np.ndarray,
+    change_points: np.ndarray,
+    *,
+    fs: int,
+) -> pd.DataFrame:
+    """以变化点为自然边界，计算每个平台的稳健与常规统计量。"""
+
+    raw_arr = np.asarray(raw, dtype=float)
+    filt_arr = np.asarray(filtered, dtype=float)
+    time_arr = np.asarray(time, dtype=float)
+    if not (raw_arr.size == filt_arr.size == time_arr.size):
+        raise ValueError("raw, filtered and time must have equal length")
+    boundaries = [0, *sorted(set(int(x) for x in change_points if 0 < int(x) < raw_arr.size)), raw_arr.size]
+    records: list[dict[str, Any]] = []
+    for segment_id, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+        values = raw_arr[start:end]
+        filtered_values = filt_arr[start:end]
+        median = float(np.median(values))
+        records.append(
+            {
+                "segment_id": segment_id,
+                "start_idx": start,
+                "end_idx": end,
+                "start_time": float(time_arr[start]),
+                "end_time": float(time_arr[end - 1] + 1.0 / fs),
+                "duration": float((end - start) / fs),
+                "median": median,
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values, ddof=1)) if values.size > 1 else 0.0,
+                "MAD": float(np.median(np.abs(values - median))),
+                "filtered_median": float(np.median(filtered_values)),
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
+
+def classify_segments(
+    segments: pd.DataFrame,
+    *,
+    raw: np.ndarray,
+    m0: float,
+    sigma0: float,
+    initial_n: int,
+    config: AnalysisConfig,
+) -> pd.DataFrame:
+    """用 M0 锚点给自然 segment 生成第一次 M/H/L 粗分类。"""
+
+    result = segments.copy()
+    threshold = config.state_separation_sigma * max(float(sigma0), config.epsilon)
+    labels: list[str] = []
+    raw_arr = np.asarray(raw, dtype=float)
+    for row in result.itertuples(index=False):
+        overlap_end = min(int(row.end_idx), int(initial_n))
+        initial_center = (
+            float(np.median(raw_arr[int(row.start_idx) : overlap_end]))
+            if int(row.start_idx) < overlap_end
+            else float("nan")
+        )
+        center = initial_center if np.isfinite(initial_center) else float(row.median)
+        distance = center - float(m0)
+        if abs(distance) <= threshold:
+            labels.append("M")
+        else:
+            labels.append("H" if distance > 0 else "L")
+    if config.use_gmm and len(result) >= 2:
+        labels = _gmm_assisted_labels(result, labels, m0=m0, sigma0=sigma0, config=config)
+    result["initial_label"] = labels
+    return result
+
+
+def estimate_dynamic_m(
+    filtered: np.ndarray,
+    segments: pd.DataFrame,
+    *,
+    fs: int,
+    sigma0: float,
+    config: AnalysisConfig,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """迭代扩展可信 M segment，并估计缓慢变化的 M(t)。"""
+
+    arr = np.asarray(filtered, dtype=float)
+    work = segments.copy()
+    trusted_ids = set(work.loc[work["initial_label"] == "M", "segment_id"].astype(int))
+    if not trusted_ids:
+        trusted_ids.add(int(work.iloc[0]["segment_id"]))
+    m_t = np.full(arr.size, float(np.median(arr)), dtype=float)
+    for _ in range(int(config.m_baseline_max_iter)):
+        trusted_mask = _segment_sample_mask(arr.size, work, trusted_ids)
+        m_t = _baseline_from_mask(arr, trusted_mask, fs=fs, smooth_sec=config.m_baseline_smooth_sec)
+        trusted_residual = arr[trusted_mask] - m_t[trusted_mask]
+        scale = max(float(sigma0), robust_sigma(trusted_residual, epsilon=config.epsilon))
+        residual_medians = []
+        for row in work.itertuples(index=False):
+            start, end = int(row.start_idx), int(row.end_idx)
+            residual_medians.append(float(np.median(arr[start:end] - m_t[start:end])))
+        work["residual_median"] = residual_medians
+        expanded = set(
+            work.loc[
+                work["residual_median"].abs() <= config.m_anchor_sigma * scale,
+                "segment_id",
+            ].astype(int)
+        ) | trusted_ids
+        if expanded == trusted_ids:
+            break
+        trusted_ids = expanded
+    trusted_mask = _segment_sample_mask(arr.size, work, trusted_ids)
+    m_t = _baseline_from_mask(arr, trusted_mask, fs=fs, smooth_sec=config.m_baseline_smooth_sec)
+    work["trusted_m"] = work["segment_id"].astype(int).isin(trusted_ids)
+    work["residual_median"] = [
+        float(np.median(arr[int(row.start_idx) : int(row.end_idx)] - m_t[int(row.start_idx) : int(row.end_idx)]))
+        for row in work.itertuples(index=False)
+    ]
+    return m_t, trusted_mask, work
+
+
+def apply_hysteresis(
+    residual_medians: np.ndarray,
+    durations: np.ndarray,
+    *,
+    sigma_m: float,
+    config: AnalysisConfig,
+) -> tuple[np.ndarray, list[str]]:
+    """在 segment 层执行进入/退出阈值不同的 H/M/L 滞回。"""
+
+    residuals = np.asarray(residual_medians, dtype=float)
+    durations_arr = np.asarray(durations, dtype=float)
+    enter = config.enter_sigma * max(float(sigma_m), config.epsilon)
+    exit_threshold = config.exit_sigma * max(float(sigma_m), config.epsilon)
+    state = "M"
+    labels: list[str] = []
+    qc_flags: list[str] = []
+    for residual, duration in zip(residuals, durations_arr):
+        allow_new_state = duration + config.epsilon >= config.min_platform_sec
+        previous = state
+        if state == "M":
+            if allow_new_state and residual > enter:
+                state = "H"
+            elif allow_new_state and residual < -enter:
+                state = "L"
+        elif state == "H":
+            if allow_new_state and residual < -enter:
+                state = "L"
+            elif residual < exit_threshold:
+                state = "M"
+        else:  # L
+            if allow_new_state and residual > enter:
+                state = "H"
+            elif residual > -exit_threshold:
+                state = "M"
+        if previous == "H" and state == "L":
+            qc_flags.append("direct_H_to_L")
+        elif previous == "L" and state == "H":
+            qc_flags.append("direct_L_to_H")
+        labels.append(state)
+    return np.asarray(labels, dtype=object), list(dict.fromkeys(qc_flags))
+
+
+def classify_udeco(
+    raw: np.ndarray,
+    *,
+    time: np.ndarray | None = None,
+    fs: int = FS_HZ,
+    config: AnalysisConfig | None = None,
+) -> dict[str, Any]:
+    """完整执行单路 Udeco 的变化点、动态 M 与滞回分类。"""
+
+    config = config or AnalysisConfig()
+    raw_arr = np.asarray(raw, dtype=float).ravel()
+    if raw_arr.size < 3 or not np.isfinite(raw_arr).all():
+        raise ValueError("raw must contain at least three finite samples")
+    if int(fs) <= 0:
+        raise ValueError("fs must be positive")
+    time_arr = np.arange(raw_arr.size, dtype=float) / float(fs) if time is None else np.asarray(time, dtype=float)
+    if time_arr.shape != raw_arr.shape or not np.isfinite(time_arr).all():
+        raise ValueError("time must be finite and have the same shape as raw")
+    filter_samples = _odd_samples(config.median_filter_sec, fs)
+    filtered = median_filter(raw_arr, size=filter_samples, mode="nearest")
+    m0, sigma0, initial_n = estimate_initial_m(
+        filtered,
+        fs=fs,
+        initial_m_sec=config.initial_m_sec,
+        epsilon=config.epsilon,
+    )
+    change_points, score = detect_change_points(filtered, fs=fs, sigma0=sigma0, config=config)
+    segments = build_segments(raw_arr, filtered, time_arr, change_points, fs=fs)
+    segments = classify_segments(
+        segments,
+        raw=raw_arr,
+        m0=m0,
+        sigma0=sigma0,
+        initial_n=initial_n,
+        config=config,
+    )
+    m_t, trusted_mask, segments = estimate_dynamic_m(
+        filtered,
+        segments,
+        fs=fs,
+        sigma0=sigma0,
+        config=config,
+    )
+    residual = filtered - m_t
+    sigma_m = max(sigma0, robust_sigma(residual[trusted_mask], epsilon=config.epsilon))
+    segment_labels, qc_flags = apply_hysteresis(
+        segments["residual_median"].to_numpy(dtype=float),
+        segments["duration"].to_numpy(dtype=float),
+        sigma_m=sigma_m,
+        config=config,
+    )
+    segments["final_label"] = segment_labels
+    segments["platform_ok"] = segments["duration"] + config.epsilon >= config.min_platform_sec
+    labels = np.full(raw_arr.size, "M", dtype=object)
+    for row in segments.itertuples(index=False):
+        labels[int(row.start_idx) : int(row.end_idx)] = str(row.final_label)
+    if initial_n < int(round(config.initial_m_sec * fs)):
+        qc_flags.append("initial_window_short")
+    statistics = _state_statistics(raw_arr, labels, filtered - m_t, fs=fs, m0=m0, sigma0=sigma0, sigma_m=sigma_m)
+    statistics["QC_flag"] = ";".join(dict.fromkeys(qc_flags)) if qc_flags else "OK"
+    return {
+        "time": time_arr,
+        "raw": raw_arr,
+        "filtered": filtered,
+        "labels": labels,
+        "M_t": m_t,
+        "residual": residual,
+        "change_points": change_points,
+        "segments": segments,
+        "statistics": statistics,
+        "debug": {
+            "change_score": score,
+            "sigma_m": sigma_m,
+            "enter_threshold": config.enter_sigma * sigma_m,
+            "exit_threshold": config.exit_sigma * sigma_m,
+            "filter_samples": filter_samples,
+            "trusted_m_mask": trusted_mask,
+        },
+    }
+
+
+def _state_statistics(
+    raw: np.ndarray,
+    labels: np.ndarray,
+    residual: np.ndarray,
+    *,
+    fs: int,
+    m0: float,
+    sigma0: float,
+    sigma_m: float,
+) -> dict[str, Any]:
+    stats: dict[str, Any] = {}
+    present: list[str] = []
+    non_m_separation: list[float] = []
+    for state in ("H", "M", "L"):
+        mask = labels == state
+        if mask.any():
+            present.append(state)
+            values = raw[mask]
+            stats[f"{state}_mean"] = float(np.mean(values))
+            stats[f"{state}_std"] = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+            stats[f"{state}_total_duration"] = float(mask.sum() / fs)
+            if state != "M":
+                non_m_separation.append(abs(float(np.median(residual[mask]))) / max(sigma_m, np.finfo(float).eps))
+        else:
+            stats[f"{state}_mean"] = float("nan")
+            stats[f"{state}_std"] = float("nan")
+            stats[f"{state}_total_duration"] = float("nan")
+    stats.update(
+        {
+            "n_detected_states": len(present),
+            "transition_count": int(np.sum(labels[1:] != labels[:-1])),
+            "M0": float(m0),
+            "sigma0": float(sigma0),
+            "sigma_M": float(sigma_m),
+            "state_separation": min(non_m_separation) if non_m_separation else float("nan"),
+        }
+    )
+    return stats
+
+
+def _baseline_from_mask(signal: np.ndarray, mask: np.ndarray, *, fs: int, smooth_sec: float) -> np.ndarray:
+    source = pd.Series(np.where(mask, signal, np.nan), dtype=float)
+    filled = source.interpolate(limit_direction="both")
+    if not filled.notna().any():
+        filled[:] = float(np.median(signal))
+    window = _odd_samples(smooth_sec, fs)
+    return filled.rolling(window=window, center=True, min_periods=1).median().to_numpy(dtype=float)
+
+
+def _segment_sample_mask(length: int, segments: pd.DataFrame, trusted_ids: set[int]) -> np.ndarray:
+    mask = np.zeros(length, dtype=bool)
+    for row in segments.itertuples(index=False):
+        if int(row.segment_id) in trusted_ids:
+            mask[int(row.start_idx) : int(row.end_idx)] = True
+    return mask
+
+
+def _odd_samples(seconds: float, fs: int) -> int:
+    samples = max(1, int(round(float(seconds) * int(fs))))
+    return samples if samples % 2 == 1 else samples + 1
+
+
+def _gmm_assisted_labels(
+    segments: pd.DataFrame,
+    labels: list[str],
+    *,
+    m0: float,
+    sigma0: float,
+    config: AnalysisConfig,
+) -> list[str]:
+    """可选 GMM/BIC 辅助；默认关闭且不改变主流程依赖。"""
+
+    from sklearn.mixture import GaussianMixture
+
+    values = segments["median"].to_numpy(dtype=float).reshape(-1, 1)
+    models = []
+    for components in range(1, min(3, len(values)) + 1):
+        model = GaussianMixture(n_components=components, random_state=0, reg_covar=config.epsilon)
+        model.fit(values)
+        models.append((model.bic(values), model))
+    model = min(models, key=lambda item: item[0])[1]
+    centers = model.means_.ravel()
+    m_component = int(np.argmin(np.abs(centers - m0)))
+    assignments = model.predict(values)
+    threshold = config.state_separation_sigma * max(sigma0, config.epsilon)
+    assisted: list[str] = []
+    for existing, component in zip(labels, assignments):
+        center = float(centers[component])
+        if component == m_component or abs(center - m0) <= threshold:
+            assisted.append("M")
+        else:
+            assisted.append("H" if center > m0 else "L")
+    return assisted
 
 
 def _repair_pydisplay_sequence(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
