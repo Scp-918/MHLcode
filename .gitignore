@@ -1,6 +1,8 @@
 __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
+.ipython/
+.jupyter_config/
+.jupyter_data/
 outputs/
 *.pyc
-

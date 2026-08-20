@@ -880,6 +880,68 @@ def export_excel(batch_results: dict[str, dict[str, Any]], output_path: str | Pa
     return output
 
 
+def select_validation_candidates(batch_results: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    """从初步批处理结果选择五类最值得人工检查的样本。"""
+
+    h_candidates: list[dict[str, Any]] = []
+    l_candidates: list[dict[str, Any]] = []
+    short_candidates: list[dict[str, Any]] = []
+    motion_candidates: list[dict[str, Any]] = []
+    drift_candidates: list[dict[str, Any]] = []
+    for subject, subject_result in batch_results.items():
+        for sample_name, sample in subject_result.get("sample_details", {}).items():
+            sensor_csv = sample.get("metadata", {}).get("sensor_csv", "")
+            motion_std = np.asarray(sample.get("motion", {}).get("window_std", []), dtype=float)
+            motion_score = float(np.nanmax(motion_std)) if motion_std.size else float("nan")
+            motion_candidates.append(
+                _candidate_record("strongest_motion", subject, sample_name, "", sensor_csv, motion_score)
+            )
+            for channel, result in sample.get("channels", {}).items():
+                labels = set(np.asarray(result.get("labels", []), dtype=object).tolist())
+                separation = float(result.get("statistics", {}).get("state_separation", np.nan))
+                if "H" in labels and "M" in labels and "L" not in labels:
+                    h_candidates.append(
+                        _candidate_record("M_plus_H", subject, sample_name, channel, sensor_csv, separation)
+                    )
+                if "L" in labels and "M" in labels and "H" not in labels:
+                    l_candidates.append(
+                        _candidate_record("M_plus_L", subject, sample_name, channel, sensor_csv, separation)
+                    )
+                segments = result.get("segments", pd.DataFrame())
+                if isinstance(segments, pd.DataFrame) and {"final_label", "duration"} <= set(segments.columns):
+                    non_m = pd.to_numeric(
+                        segments.loc[segments["final_label"] != "M", "duration"], errors="coerce"
+                    ).dropna()
+                    if not non_m.empty:
+                        short_candidates.append(
+                            _candidate_record(
+                                "shortest_non_M", subject, sample_name, channel, sensor_csv, float(non_m.min())
+                            )
+                        )
+                baseline = np.asarray(result.get("M_t", []), dtype=float)
+                drift = abs(float(baseline[-1] - baseline[0])) if baseline.size >= 2 else float("nan")
+                drift_candidates.append(
+                    _candidate_record("largest_M_drift", subject, sample_name, channel, sensor_csv, drift)
+                )
+    selected: list[dict[str, Any]] = []
+    if h_candidates:
+        selected.append(max(h_candidates, key=_finite_score_for_max))
+    if l_candidates:
+        selected.append(max(l_candidates, key=_finite_score_for_max))
+    if short_candidates:
+        selected.append(min(short_candidates, key=_finite_score_for_min))
+    finite_motion = [item for item in motion_candidates if np.isfinite(item["score"])]
+    if finite_motion:
+        selected.append(max(finite_motion, key=_finite_score_for_max))
+    finite_drift = [item for item in drift_candidates if np.isfinite(item["score"])]
+    if finite_drift:
+        selected.append(max(finite_drift, key=_finite_score_for_max))
+    return pd.DataFrame.from_records(
+        selected,
+        columns=["category", "subject", "sample_name", "channel", "sensor_csv", "score"],
+    )
+
+
 def plot_validation(
     sample_result: dict[str, Any],
     *,
@@ -1114,6 +1176,34 @@ def _safe_sheet_name(subject: str) -> str:
     return (cleaned or "subject")[:31]
 
 
+def _candidate_record(
+    category: str,
+    subject: str,
+    sample_name: str,
+    channel: str,
+    sensor_csv: str,
+    score: float,
+) -> dict[str, Any]:
+    return {
+        "category": category,
+        "subject": subject,
+        "sample_name": sample_name,
+        "channel": channel,
+        "sensor_csv": sensor_csv,
+        "score": float(score),
+    }
+
+
+def _finite_score_for_max(record: dict[str, Any]) -> float:
+    score = float(record["score"])
+    return score if np.isfinite(score) else -float("inf")
+
+
+def _finite_score_for_min(record: dict[str, Any]) -> float:
+    score = float(record["score"])
+    return score if np.isfinite(score) else float("inf")
+
+
 def _state_statistics(
     raw: np.ndarray,
     labels: np.ndarray,
@@ -1190,8 +1280,14 @@ def _gmm_assisted_labels(
 
     values = segments["median"].to_numpy(dtype=float).reshape(-1, 1)
     models = []
-    for components in range(1, min(3, len(values)) + 1):
-        model = GaussianMixture(n_components=components, random_state=0, reg_covar=config.epsilon)
+    max_components = min(3, len(values), np.unique(values.ravel()).size)
+    for components in range(1, max_components + 1):
+        model = GaussianMixture(
+            n_components=components,
+            random_state=0,
+            reg_covar=config.epsilon,
+            init_params="k-means++",
+        )
         model.fit(values)
         models.append((model.bic(values), model))
     model = min(models, key=lambda item: item[0])[1]

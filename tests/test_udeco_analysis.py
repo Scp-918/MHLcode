@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import matplotlib
+import nbformat
 from openpyxl import load_workbook
 from scipy.io import savemat
 
@@ -25,6 +26,7 @@ from udeco_analysis import (
     load_udeco_sample,
     plot_validation,
     robust_sigma,
+    select_validation_candidates,
     summarize_subject,
 )
 
@@ -170,6 +172,24 @@ def test_classify_udeco_preserves_200_ms_l_state() -> None:
     assert result["statistics"]["L_total_duration"] == pytest.approx(0.2)
 
 
+@pytest.mark.filterwarnings("error")
+def test_optional_gmm_path_runs_on_segment_medians_only() -> None:
+    fs = 100
+    time = np.arange(500, dtype=float) / fs
+    raw = np.zeros(time.size)
+    raw[(time >= 2.0) & (time < 2.5)] = 1.0
+
+    result = classify_udeco(
+        raw,
+        time=time,
+        fs=fs,
+        config=AnalysisConfig(initial_m_sec=1.0, use_gmm=True),
+    )
+
+    assert {"M", "H"} == set(result["labels"])
+    assert len(result["segments"]) < len(raw)
+
+
 def test_classify_udeco_rejects_single_sample_spike() -> None:
     fs = 100
     time = np.arange(500, dtype=float) / fs
@@ -279,6 +299,15 @@ def test_analyze_subject_keeps_bad_sample_as_error_rows(tmp_path: Path) -> None:
     assert "analysis_error" in set(result["qc"]["category"])
 
 
+def test_analyze_all_subjects_keeps_missing_subject_as_subject_qc(tmp_path: Path) -> None:
+    batch = analyze_all_subjects(tmp_path, ["ts", "lyx"])
+
+    assert set(batch) == {"ts", "lyx"}
+    assert batch["ts"]["sample_results"].empty
+    assert batch["lyx"]["sample_results"].empty
+    assert set(batch["ts"]["qc"]["category"]) == {"subject_error"}
+
+
 def test_subject_summary_ignores_nan_and_counts_valid_samples() -> None:
     sample_results = pd.DataFrame(
         [
@@ -340,3 +369,78 @@ def test_export_excel_writes_six_subject_sheets_and_three_parts(tmp_path: Path) 
     assert "Part A: Sample-level results" in values
     assert "Part B: Subject summary" in values
     assert "Part C: Skipped files / QC" in values
+
+
+def test_select_validation_candidates_covers_key_manual_checks() -> None:
+    def channel_result(labels: list[str], durations: list[float], *, drift: float = 0.0) -> dict:
+        return {
+            "labels": np.asarray(labels, dtype=object),
+            "M_t": np.asarray([0.0, drift]),
+            "statistics": {
+                "H_mean": 1.0 if "H" in labels else np.nan,
+                "L_mean": -1.0 if "L" in labels else np.nan,
+            },
+            "segments": pd.DataFrame({"final_label": labels, "duration": durations}),
+        }
+
+    batch = {
+        "ts": {
+            "sample_details": {
+                "ts_write_1": {
+                    "sample_name": "ts_write_1",
+                    "subject": "ts",
+                    "metadata": {"sensor_csv": "ts_write_1_sensor.csv"},
+                    "motion": {"window_std": np.asarray([0.1, 2.0])},
+                    "channels": {
+                        "Udeco2": channel_result(["M", "H", "M"], [1.0, 0.1, 1.0], drift=0.4),
+                        "Udeco3": channel_result(["M", "L", "M"], [1.0, 0.2, 1.0]),
+                    },
+                }
+            }
+        }
+    }
+
+    candidates = select_validation_candidates(batch)
+
+    assert {"M_plus_H", "M_plus_L", "shortest_non_M", "strongest_motion", "largest_M_drift"} <= set(
+        candidates["category"]
+    )
+
+
+def test_notebook_has_required_configuration_and_workflow_sections() -> None:
+    path = Path("udeco_state_analysis.ipynb")
+    assert path.is_file()
+    notebook = nbformat.read(path, as_version=4)
+    nbformat.validate(notebook)
+    for cell in notebook.cells:
+        if cell.cell_type == "code":
+            assert cell.execution_count is None
+            assert cell.outputs == []
+    markdown = "\n".join(cell.source for cell in notebook.cells if cell.cell_type == "markdown")
+    code = "\n".join(cell.source for cell in notebook.cells if cell.cell_type == "code")
+
+    for section in (
+        "用户参数区",
+        "Validation / Manual Inspection",
+        "批量分析",
+        "Excel 输出",
+        "汇总检查",
+    ):
+        assert section in markdown
+    for setting in (
+        "DATA_ROOT",
+        "SUBJECTS",
+        "MEDIAN_FILTER_SEC",
+        "CHANGE_WINDOW_SEC",
+        "ENTER_SIGMA",
+        "EXIT_SIGMA",
+        "USE_GMM",
+        "VALIDATION_FILE",
+        "SHOW_DEBUG_INFO",
+        "RUN_BATCH",
+        "OUTPUT_EXCEL",
+    ):
+        assert setting in code
+    assert "analyze_sample" in code
+    assert "analyze_all_subjects" in code
+    assert "export_excel" in code
