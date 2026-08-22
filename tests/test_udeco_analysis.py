@@ -21,6 +21,7 @@ from udeco_analysis import (
     classify_udeco,
     detect_motion_stage,
     discover_subject_samples,
+    export_batch_figures,
     export_excel,
     load_calibration,
     load_udeco_sample,
@@ -215,6 +216,75 @@ def test_dynamic_m_tracks_slow_drift_without_false_h_or_l() -> None:
     assert result["M_t"][-1] - result["M_t"][0] > 0.15
 
 
+def test_smooth_s_shaped_drift_stays_m_without_confirmed_step() -> None:
+    fs = 100
+    time = np.arange(1400, dtype=float) / fs
+    rng = np.random.default_rng(102)
+    raw = 0.75 * np.tanh((time - 7.0) / 0.65) + rng.normal(0.0, 0.003, time.size)
+
+    result = classify_udeco(raw, time=time, fs=fs, config=AnalysisConfig(initial_m_sec=1.0))
+
+    assert set(result["labels"]) == {"M"}
+    assert result["change_points"].size == 0
+
+
+def test_quadratic_drift_stays_m_without_confirmed_step() -> None:
+    fs = 100
+    time = np.arange(2000, dtype=float) / fs
+    rng = np.random.default_rng(11)
+    raw = 0.001 * time**2 + rng.normal(0.0, 0.004, time.size)
+
+    result = classify_udeco(raw, time=time, fs=fs, config=AnalysisConfig(initial_m_sec=1.0))
+
+    assert set(result["labels"]) == {"M"}
+    assert result["change_points"].size == 0
+
+
+@pytest.mark.parametrize(("offset", "state"), [(0.8, "H"), (-0.8, "L")])
+def test_persistent_step_enters_expected_state(offset: float, state: str) -> None:
+    fs = 100
+    time = np.arange(900, dtype=float) / fs
+    rng = np.random.default_rng(103 if offset > 0 else 104)
+    raw = rng.normal(0.0, 0.004, time.size)
+    raw[time >= 3.0] += offset
+
+    result = classify_udeco(raw, time=time, fs=fs, config=AnalysisConfig(initial_m_sec=1.0))
+
+    assert len(result["change_points"]) == 1
+    assert result["change_points"][0] == pytest.approx(300, abs=3)
+    assert np.mean(result["labels"][time >= 3.0] == state) >= 0.95
+    assert {"candidate_idx", "confirmed", "amplitude", "local_sigma", "transition_duration", "rejection_reason"} <= set(
+        result["debug"]["step_events"].columns
+    )
+
+
+def test_step_on_drifting_background_is_only_confirmed_step() -> None:
+    fs = 100
+    time = np.arange(1400, dtype=float) / fs
+    rng = np.random.default_rng(105)
+    raw = 0.02 * time + rng.normal(0.0, 0.004, time.size)
+    raw[time >= 6.0] += 0.75
+
+    result = classify_udeco(raw, time=time, fs=fs, config=AnalysisConfig(initial_m_sec=1.0))
+
+    assert len(result["change_points"]) == 1
+    assert result["change_points"][0] == pytest.approx(600, abs=3)
+    assert np.mean(result["labels"][time >= 6.0] == "H") >= 0.95
+
+
+def test_short_spike_does_not_create_confirmed_step() -> None:
+    fs = 100
+    time = np.arange(1200, dtype=float) / fs
+    rng = np.random.default_rng(106)
+    raw = rng.normal(0.0, 0.01, time.size)
+    raw[600:603] += 1.0
+
+    result = classify_udeco(raw, time=time, fs=fs, config=AnalysisConfig(initial_m_sec=1.0))
+
+    assert set(result["labels"]) == {"M"}
+    assert result["change_points"].size == 0
+
+
 def test_three_states_and_direct_h_l_transition_are_retained_and_flagged() -> None:
     fs = 100
     time = np.arange(500, dtype=float) / fs
@@ -274,6 +344,94 @@ def test_analyze_sample_keeps_udeco_channels_independent_and_plots(tmp_path: Pat
     assert "H" not in result["channels"]["Udeco3"]["labels"]
     assert len(main_fig.axes) == 2
     assert len(debug_fig.axes) == 8
+
+
+def test_export_batch_figures_writes_static_two_panel_png(tmp_path: Path) -> None:
+    subject_dir = tmp_path / "ts"
+    subject_dir.mkdir()
+    write_calibration(tmp_path)
+    sensor = subject_dir / "ts_write_1_sensor.csv"
+    write_sensor(sensor, n=500)
+    result = analyze_sample(sensor, data_root=tmp_path, config=AnalysisConfig(initial_m_sec=1.0))
+    batch = {
+        "ts": {
+            "sample_details": {result["sample_name"]: result},
+            "qc": pd.DataFrame(columns=["sample_name", "file_name", "category", "reason"]),
+        }
+    }
+
+    report = export_batch_figures(batch, tmp_path / "outputs")
+
+    assert report.loc[0, "status"] == "ok"
+    figure_path = Path(report.loc[0, "figure_path"])
+    assert figure_path == tmp_path / "outputs" / "figures" / "ts" / "ts_write_1.png"
+    assert figure_path.is_file()
+    from matplotlib.image import imread
+
+    image = imread(figure_path)
+    assert image.ndim in {2, 3}
+    assert image.shape[0] > 0 and image.shape[1] > 0
+    main_fig, debug_fig = plot_validation(result, show_debug_info=False)
+    try:
+        assert len(main_fig.axes) == 2
+        assert {line.get_label() for line in main_fig.axes[0].lines} >= {"Raw Udeco", "Filtered Udeco", "M(t)"}
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(main_fig)
+        assert debug_fig is None
+
+
+def test_export_batch_figures_records_failure_and_continues(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    subject_dir = tmp_path / "ts"
+    subject_dir.mkdir()
+    write_calibration(tmp_path)
+    sensor = subject_dir / "ts_write_1_sensor.csv"
+    write_sensor(sensor, n=500)
+    good = analyze_sample(sensor, data_root=tmp_path, config=AnalysisConfig(initial_m_sec=1.0))
+    bad = dict(good)
+    bad["sample_name"] = "ts_write_bad"
+    batch = {
+        "ts": {
+            "subject": "ts",
+            "sample_results": pd.DataFrame(
+                [
+                    dict(channel_result["statistics"], motion_type="write", motion_index=1)
+                    for channel_result in good["channels"].values()
+                ]
+            ),
+            "summary": summarize_subject(
+                pd.DataFrame(
+                    [
+                        dict(channel_result["statistics"], motion_type="write", motion_index=1)
+                        for channel_result in good["channels"].values()
+                    ]
+                )
+            ),
+            "sample_details": {"ts_write_bad": bad, "ts_write_1": good},
+            "qc": pd.DataFrame(columns=["sample_name", "file_name", "category", "reason"]),
+        }
+    }
+    original_plot = plot_validation
+
+    def flaky_plot(sample_result: dict[str, object], *, show_debug_info: bool = True):
+        main_fig, debug_fig = original_plot(sample_result, show_debug_info=show_debug_info)
+        if sample_result["sample_name"] == "ts_write_bad":
+            def fail_savefig(*args: object, **kwargs: object) -> None:
+                raise RuntimeError("synthetic save failure")
+
+            main_fig.savefig = fail_savefig
+        return main_fig, debug_fig
+
+    monkeypatch.setattr("udeco_analysis.plot_validation", flaky_plot)
+    report = export_batch_figures(batch, tmp_path / "outputs")
+
+    assert report.set_index("sample_name").loc["ts_write_bad", "status"] == "error"
+    assert report.set_index("sample_name").loc["ts_write_1", "status"] == "ok"
+    assert "figure_export_error" in set(batch["ts"]["qc"]["category"])
+    output = export_excel(batch, tmp_path / "results.xlsx")
+    workbook = load_workbook(output, data_only=True)
+    assert "figure_export_error" in [cell.value for row in workbook["ts"].iter_rows() for cell in row]
 
 
 def test_analyze_subject_keeps_bad_sample_as_error_rows(tmp_path: Path) -> None:
@@ -432,6 +590,9 @@ def test_notebook_has_required_configuration_and_workflow_sections() -> None:
         "SUBJECTS",
         "MEDIAN_FILTER_SEC",
         "CHANGE_WINDOW_SEC",
+        "STEP_LOCAL_WINDOW_SEC",
+        "STEP_MAX_TRANSITION_SEC",
+        "STEP_STABILITY_SIGMA",
         "ENTER_SIGMA",
         "EXIT_SIGMA",
         "USE_GMM",
@@ -443,4 +604,8 @@ def test_notebook_has_required_configuration_and_workflow_sections() -> None:
         assert setting in code
     assert "analyze_sample" in code
     assert "analyze_all_subjects" in code
+    assert "%matplotlib widget" in code
+    assert "OUTPUT_ROOT" in code
+    assert "export_batch_figures" in code
+    assert code.index("export_batch_figures") < code.index("export_excel")
     assert "export_excel" in code

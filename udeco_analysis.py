@@ -110,6 +110,9 @@ class AnalysisConfig:
     change_window_sec: float = 0.03
     change_threshold_sigma: float = 5.0
     change_peak_merge_sec: float = 0.04
+    step_local_window_sec: float = 0.30
+    step_max_transition_sec: float = 0.08
+    step_stability_sigma: float = 3.0
     min_platform_sec: float = 0.06
     state_separation_sigma: float = 4.0
     m_anchor_sigma: float = 2.5
@@ -132,6 +135,9 @@ class AnalysisConfig:
             "change_window_sec": self.change_window_sec,
             "change_threshold_sigma": self.change_threshold_sigma,
             "change_peak_merge_sec": self.change_peak_merge_sec,
+            "step_local_window_sec": self.step_local_window_sec,
+            "step_max_transition_sec": self.step_max_transition_sec,
+            "step_stability_sigma": self.step_stability_sigma,
             "min_platform_sec": self.min_platform_sec,
             "state_separation_sigma": self.state_separation_sigma,
             "m_anchor_sigma": self.m_anchor_sigma,
@@ -332,41 +338,221 @@ def detect_change_points(
     sigma0: float,
     config: AnalysisConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """用短时左右窗口中位数差检测并合并平台变化点。"""
+    """Return only local, persistent step events as change points."""
 
-    arr = np.asarray(signal, dtype=float)
+    points, score, _ = _detect_step_events(signal, fs=fs, sigma0=sigma0, config=config)
+    return points, score
+
+
+def _detect_step_events(
+    signal: np.ndarray,
+    *,
+    fs: int,
+    sigma0: float,
+    config: AnalysisConfig,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Generate short-window candidates and validate them as true steps."""
+
+    arr = np.asarray(signal, dtype=float).ravel()
     n = arr.size
-    window = max(1, int(round(config.change_window_sec * int(fs))))
+    candidate_window = max(1, int(round(config.change_window_sec * int(fs))))
+    local_window = max(candidate_window, int(round(config.step_local_window_sec * int(fs))))
     score = np.zeros(n, dtype=float)
-    scale = max(float(sigma0), config.epsilon)
-    if n < 2 * window + 1:
-        return np.asarray([], dtype=int), score
-    for index in range(window, n - window):
-        left = float(np.median(arr[index - window : index]))
-        right = float(np.median(arr[index : index + window]))
-        score[index] = abs(right - left) / scale
-    peaks, _ = find_peaks(score, height=config.change_threshold_sigma)
-    if peaks.size == 0:
-        return np.asarray([], dtype=int), score
+    columns = [
+        "candidate_idx",
+        "confirmed",
+        "amplitude",
+        "local_sigma",
+        "transition_duration",
+        "rejection_reason",
+    ]
+    if n < 2 * local_window + 1:
+        return np.asarray([], dtype=int), score, pd.DataFrame(columns=columns)
 
-    # 将得分峰细化到局部最大相邻跃变处，使 segment 边界贴近真实阶跃。
+    scale = max(float(sigma0), config.epsilon)
+    for index in range(candidate_window, n - candidate_window):
+        left = float(np.median(arr[index - candidate_window : index]))
+        right = float(np.median(arr[index : index + candidate_window]))
+        score[index] = abs(right - left) / scale
+    peaks, _ = find_peaks(
+        score,
+        height=config.change_threshold_sigma,
+        prominence=config.change_threshold_sigma,
+    )
+    if peaks.size == 0:
+        return np.asarray([], dtype=int), score, pd.DataFrame(columns=columns)
+
     refined: list[int] = []
     local_delta = np.abs(np.diff(arr))
     for peak in peaks:
-        lo = max(0, int(peak) - window)
-        hi = min(local_delta.size, int(peak) + window)
+        lo = max(0, int(peak) - candidate_window)
+        hi = min(local_delta.size, int(peak) + candidate_window)
         boundary = int(np.argmax(local_delta[lo:hi]) + lo + 1) if hi > lo else int(peak)
         refined.append(boundary)
     candidates = sorted(set(index for index in refined if 0 < index < n))
     merge_samples = max(1, int(round(config.change_peak_merge_sec * int(fs))))
-    groups: list[list[int]] = []
+    merged: list[int] = []
     for index in candidates:
-        if not groups or index - groups[-1][-1] > merge_samples:
-            groups.append([index])
-        else:
-            groups[-1].append(index)
-    merged = [max(group, key=lambda idx: score[min(max(idx, 0), n - 1)]) for group in groups]
-    return np.asarray(merged, dtype=int), score
+        if not merged or index - merged[-1] > merge_samples:
+            merged.append(index)
+        elif score[index] > score[merged[-1]]:
+            merged[-1] = index
+
+    records: list[dict[str, Any]] = []
+    confirmed: list[int] = []
+    for index in merged:
+        amplitude, local_sigma, duration, reason = _validate_step_candidate(
+            arr,
+            index,
+            fs=fs,
+            candidate_window=candidate_window,
+            local_window=local_window,
+            sigma0=sigma0,
+            config=config,
+        )
+        accepted = not reason
+        records.append(
+            {
+                "candidate_idx": int(index),
+                "confirmed": bool(accepted),
+                "amplitude": float(amplitude),
+                "local_sigma": float(local_sigma),
+                "transition_duration": float(duration),
+                "rejection_reason": reason,
+            }
+        )
+        if accepted:
+            confirmed.append(int(index))
+    return np.asarray(confirmed, dtype=int), score, pd.DataFrame.from_records(records, columns=columns)
+
+
+def _validate_step_candidate(
+    signal: np.ndarray,
+    index: int,
+    *,
+    fs: int,
+    candidate_window: int,
+    local_window: int,
+    sigma0: float,
+    config: AnalysisConfig,
+) -> tuple[float, float, float, str]:
+    """Validate amplitude, transition speed, and post-step persistence."""
+
+    n = signal.size
+    if index < local_window or index > n - local_window:
+        return float("nan"), float("nan"), float("nan"), "insufficient_local_window"
+    level_window = max(candidate_window, int(round(config.min_platform_sec * int(fs))))
+    if index < level_window or index > n - level_window:
+        return float("nan"), float("nan"), float("nan"), "insufficient_platform_window"
+    pre = signal[index - level_window : index]
+    post = signal[index : index + level_window]
+    pre_level, pre_residual = _robust_side_level(pre, edge="right")
+    post_level, post_residual = _robust_side_level(post, edge="left")
+    broad_pre = signal[index - local_window : index]
+    broad_post = signal[index : index + local_window]
+    broad_pre_level, _ = _robust_side_level(broad_pre, edge="right")
+    broad_post_level, _ = _robust_side_level(broad_post, edge="left")
+    amplitude = float(broad_post_level - broad_pre_level)
+    local_sigma = max(
+        float(sigma0),
+        robust_sigma(pre_residual, epsilon=config.epsilon),
+        robust_sigma(post_residual, epsilon=config.epsilon),
+        config.epsilon,
+    )
+    if abs(amplitude) < config.change_threshold_sigma * local_sigma:
+        return amplitude, local_sigma, float("nan"), "amplitude_below_threshold"
+
+    duration = _step_transition_duration(
+        signal,
+        index,
+        pre_level=pre_level,
+        post_level=post_level,
+        fs=fs,
+        window=local_window,
+    )
+    if not np.isfinite(duration):
+        return amplitude, local_sigma, duration, "transition_unresolved"
+    if duration > config.step_max_transition_sec + config.epsilon:
+        return amplitude, local_sigma, duration, "transition_too_long"
+
+    transition_samples = max(1, int(round(duration * int(fs))))
+    persistence_samples = max(1, int(round(config.min_platform_sec * int(fs))))
+    persist_start = index + transition_samples
+    persist_end = persist_start + persistence_samples
+    if persist_end > n:
+        return amplitude, local_sigma, duration, "insufficient_post_persistence"
+    persist = signal[persist_start:persist_end]
+    _, persist_residual = _robust_side_level(persist, edge="left")
+    raw_block_medians = [float(np.median(block)) for block in np.array_split(persist, 3) if len(block)]
+    residual_block_medians = [
+        float(np.median(block)) for block in np.array_split(persist_residual, 3) if len(block)
+    ]
+    tolerance = config.step_stability_sigma * local_sigma
+    raw_unstable = raw_block_medians and max(
+        abs(value - float(np.median(raw_block_medians))) for value in raw_block_medians
+    ) > tolerance
+    residual_unstable = residual_block_medians and max(
+        abs(value - float(np.median(residual_block_medians))) for value in residual_block_medians
+    ) > tolerance
+    if raw_unstable or residual_unstable:
+        return amplitude, local_sigma, duration, "post_level_unstable"
+    return amplitude, local_sigma, duration, ""
+
+
+def _robust_side_level(values: np.ndarray, *, edge: str) -> tuple[float, np.ndarray]:
+    """Estimate an edge level and residuals from two robust half-window medians."""
+
+    arr = np.asarray(values, dtype=float)
+    if arr.size < 2:
+        level = float(np.median(arr)) if arr.size else 0.0
+        return level, arr - level
+    half = max(1, arr.size // 2)
+    first = float(np.median(arr[:half]))
+    last = float(np.median(arr[-half:]))
+    x_first = (half - 1) / 2.0
+    x_last = arr.size - half + (half - 1) / 2.0
+    slope = (last - first) / max(1.0, x_last - x_first)
+    positions = np.arange(arr.size, dtype=float)
+    fitted = first + slope * (positions - x_first)
+    boundary = arr.size if edge == "right" else 0.0
+    level = first + slope * (boundary - x_first)
+    return float(level), arr - fitted
+
+
+def _step_transition_duration(
+    signal: np.ndarray,
+    index: int,
+    *,
+    pre_level: float,
+    post_level: float,
+    fs: int,
+    window: int,
+) -> float:
+    """Estimate filtered 10%-to-90% transition duration around a candidate."""
+
+    delta = float(post_level - pre_level)
+    if not np.isfinite(delta) or abs(delta) <= np.finfo(float).eps:
+        return float("nan")
+    low = pre_level + 0.1 * delta
+    high = pre_level + 0.9 * delta
+    start = max(0, index - window)
+    end = min(signal.size, index + window + 1)
+    values = signal[start:end]
+    positions = np.arange(start, end)
+    if delta > 0:
+        low_indices = positions[values >= low]
+        high_indices = positions[values >= high]
+    else:
+        low_indices = positions[values <= low]
+        high_indices = positions[values <= high]
+    low_indices = low_indices[low_indices >= index - max(1, window // 2)]
+    if low_indices.size == 0:
+        return float("nan")
+    low_index = int(low_indices[0])
+    high_indices = high_indices[high_indices >= low_index]
+    if high_indices.size == 0:
+        return float("nan")
+    return max(0.0, float(int(high_indices[0]) - low_index) / float(fs))
 
 
 def build_segments(
@@ -494,7 +680,7 @@ def apply_hysteresis(
     sigma_m: float,
     config: AnalysisConfig,
 ) -> tuple[np.ndarray, list[str]]:
-    """在 segment 层执行进入/退出阈值不同的 H/M/L 滞回。"""
+    """Apply enter/exit hysteresis only after the initial M segment."""
 
     residuals = np.asarray(residual_medians, dtype=float)
     durations_arr = np.asarray(durations, dtype=float)
@@ -503,7 +689,10 @@ def apply_hysteresis(
     state = "M"
     labels: list[str] = []
     qc_flags: list[str] = []
-    for residual, duration in zip(residuals, durations_arr):
+    for segment_index, (residual, duration) in enumerate(zip(residuals, durations_arr)):
+        if segment_index == 0:
+            labels.append("M")
+            continue
         allow_new_state = duration + config.epsilon >= config.min_platform_sec
         previous = state
         if state == "M":
@@ -516,7 +705,7 @@ def apply_hysteresis(
                 state = "L"
             elif residual < exit_threshold:
                 state = "M"
-        else:  # L
+        else:
             if allow_new_state and residual > enter:
                 state = "H"
             elif residual > -exit_threshold:
@@ -555,7 +744,7 @@ def classify_udeco(
         initial_m_sec=config.initial_m_sec,
         epsilon=config.epsilon,
     )
-    change_points, score = detect_change_points(filtered, fs=fs, sigma0=sigma0, config=config)
+    change_points, score, step_events = _detect_step_events(filtered, fs=fs, sigma0=sigma0, config=config)
     segments = build_segments(raw_arr, filtered, time_arr, change_points, fs=fs)
     segments = classify_segments(
         segments,
@@ -607,6 +796,7 @@ def classify_udeco(
             "exit_threshold": config.exit_sigma * sigma_m,
             "filter_samples": filter_samples,
             "trusted_m_mask": trusted_mask,
+            "step_events": step_events,
         },
     }
 
@@ -963,6 +1153,7 @@ def plot_validation(
         for start, end, label in _contiguous_label_runs(time, result["labels"], sample_result["fs"]):
             axis.axvspan(start, end, color=colors[label], alpha=0.16, zorder=0)
         axis.plot(time, result["raw"], color="black", linewidth=0.8, label="Raw Udeco", zorder=4)
+        axis.plot(time, result["filtered"], color="#6C757D", linewidth=0.9, label="Filtered Udeco", zorder=3)
         axis.plot(time, result["M_t"], color="#264653", linewidth=1.2, linestyle="--", label="M(t)", zorder=3)
         enter = float(result["debug"]["enter_threshold"])
         axis.plot(time, result["M_t"] + enter, color="#E76F51", linewidth=0.7, linestyle=":", alpha=0.8)
@@ -976,6 +1167,7 @@ def plot_validation(
         axis.grid(alpha=0.15)
         handles = [
             Line2D([0], [0], color="black", linewidth=1.0, label="Raw Udeco"),
+            Line2D([0], [0], color="#6C757D", linewidth=1.0, label="Filtered Udeco"),
             Line2D([0], [0], color="#264653", linestyle="--", label="M(t)"),
             *[Patch(facecolor=colors[state], alpha=0.22, label=state) for state in ("H", "M", "L")],
         ]
@@ -999,7 +1191,31 @@ def plot_validation(
         debug_axes[1, column].axhline(
             result["debug"].get("change_threshold_sigma", np.nan), color="#D62828", linestyle="--"
         )
-        debug_axes[1, column].set_ylabel("S(t)")
+        step_events = result["debug"].get("step_events")
+        if isinstance(step_events, pd.DataFrame) and not step_events.empty:
+            candidate_indices = step_events["candidate_idx"].to_numpy(dtype=int)
+            valid_indices = (candidate_indices >= 0) & (candidate_indices < len(time))
+            candidate_indices = candidate_indices[valid_indices]
+            confirmed = step_events.loc[valid_indices, "confirmed"].to_numpy(dtype=bool)
+            event_scores = result["debug"]["change_score"][candidate_indices]
+            debug_axes[1, column].scatter(
+                time[candidate_indices],
+                event_scores,
+                c=np.where(confirmed, "#2A9D8F", "#E76F51"),
+                s=20,
+                zorder=4,
+                label="Confirmed step" if confirmed.any() else "Rejected candidate",
+            )
+            for point, is_confirmed in zip(candidate_indices, confirmed):
+                debug_axes[1, column].axvline(
+                    time[int(point)],
+                    color="#2A9D8F" if is_confirmed else "#E76F51",
+                    linestyle="-" if is_confirmed else ":",
+                    linewidth=0.6,
+                    alpha=0.7,
+                )
+            debug_axes[1, column].legend(loc="upper right")
+        debug_axes[1, column].set_ylabel("Step candidate score")
         debug_axes[2, column].plot(time, result["residual"], color="#1D3557", linewidth=0.8)
         enter = float(result["debug"]["enter_threshold"])
         exit_threshold = float(result["debug"]["exit_threshold"])
@@ -1015,6 +1231,77 @@ def plot_validation(
             debug_axes[row, column].grid(alpha=0.15)
     debug_fig.suptitle(f"{sample_result['sample_name']} | Debug diagnostics")
     return main_fig, debug_fig
+
+
+def export_batch_figures(
+    batch_results: dict[str, dict[str, Any]],
+    output_root: str | Path,
+    *,
+    dpi: int = 150,
+) -> pd.DataFrame:
+    """Save one static validation PNG per analyzed sample and record failures."""
+
+    import matplotlib.pyplot as plt
+
+    columns = ["subject", "sample_name", "figure_path", "status", "error_message"]
+    records: list[dict[str, Any]] = []
+    figures_root = Path(output_root) / "figures"
+    for subject, subject_result in batch_results.items():
+        qc = subject_result.get("qc")
+        if not isinstance(qc, pd.DataFrame):
+            qc = pd.DataFrame(columns=["sample_name", "file_name", "category", "reason"])
+        qc = qc.copy()
+        for sample_name, sample_result in subject_result.get("sample_details", {}).items():
+            figure_path = figures_root / str(subject) / f"{sample_name}.png"
+            main_fig = None
+            debug_fig = None
+            try:
+                figure_path.parent.mkdir(parents=True, exist_ok=True)
+                main_fig, debug_fig = plot_validation(sample_result, show_debug_info=False)
+                main_fig.savefig(figure_path, dpi=int(dpi), format="png", bbox_inches="tight")
+                records.append(
+                    {
+                        "subject": subject,
+                        "sample_name": sample_name,
+                        "figure_path": str(figure_path),
+                        "status": "ok",
+                        "error_message": "",
+                    }
+                )
+            except Exception as exc:  # pragma: no cover - exercised by failure-injection test
+                message = f"{type(exc).__name__}: {exc}"
+                records.append(
+                    {
+                        "subject": subject,
+                        "sample_name": sample_name,
+                        "figure_path": str(figure_path),
+                        "status": "error",
+                        "error_message": message,
+                    }
+                )
+                qc = pd.concat(
+                    [
+                        qc,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "sample_name": sample_name,
+                                    "file_name": Path(sample_result.get("metadata", {}).get("sensor_csv", "")).name,
+                                    "category": "figure_export_error",
+                                    "reason": message,
+                                }
+                            ]
+                        ),
+                    ],
+                    ignore_index=True,
+                )
+            finally:
+                if main_fig is not None:
+                    plt.close(main_fig)
+                if debug_fig is not None:
+                    plt.close(debug_fig)
+        subject_result["qc"] = qc
+    return pd.DataFrame.from_records(records, columns=columns)
 
 
 def _safe_bandpass(signal: np.ndarray, fs: int, low_hz: float, high_hz: float) -> np.ndarray:
