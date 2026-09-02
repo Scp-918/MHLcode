@@ -4,5 +4,6 @@ __pycache__/
 .ipython/
 .jupyter_config/
 .jupyter_data/
+.worktrees/
 outputs/
 *.pyc
