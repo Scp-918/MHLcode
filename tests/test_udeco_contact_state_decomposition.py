@@ -3,9 +3,12 @@
 import numpy as np
 import pytest
 
+import udeco_contact_state_decomposition as contact_module
 from udeco_contact_state_decomposition import (
     ContactStateConfig,
+    decompose_contact_state_udeco,
     detect_transition_candidates,
+    estimate_conditional_bslow,
     estimate_pilot_trend,
     hampel_filter,
     infer_contact_states,
@@ -58,6 +61,21 @@ def _candidate(
         "accepted": False,
         "rejection_reason": "awaiting_state_inference",
     }
+
+
+def _use_known_candidates(monkeypatch, candidates: list[dict], bpilot: np.ndarray) -> None:
+    """让阶段三测试聚焦状态之后的分解，不重复验证候选检测器。"""
+    pilot = {
+        "Bpilot": bpilot,
+        "fast_residual": np.zeros_like(bpilot),
+        "pilot_slope": np.gradient(bpilot),
+    }
+    monkeypatch.setattr(contact_module, "estimate_pilot_trend", lambda *_: pilot)
+    monkeypatch.setattr(
+        contact_module,
+        "detect_transition_candidates",
+        lambda *_: (candidates, {"residual": np.zeros_like(bpilot), "scores": np.zeros_like(bpilot), "scales_s": []}),
+    )
 
 
 def test_complete_detach_gap_attach_pair_is_accepted_and_inpainted():
@@ -496,3 +514,159 @@ def test_candidate_detection_rejects_invalid_clean_input_directly(signal):
     """若候选接口绕过输入校验，坏输入会污染多尺度统计量。"""
     with pytest.raises((TypeError, ValueError)):
         detect_transition_candidates(signal, signal, 100.0, ContactStateConfig())
+
+
+def test_complete_pair_produces_finite_closed_physical_components(monkeypatch):
+    """完整脱离/附着后，P 在非接触段为零，J 恢复接触后也回到零。"""
+    fs = 20.0
+    time = np.arange(int(42 * fs)) / fs
+    contact_level = 10.0 + 1e-4 * time
+    signal = contact_level.copy()
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(35 * fs), int(36 * fs)
+    signal[detach_start : detach_end + 1] = np.linspace(
+        contact_level[detach_start], 4.0, detach_end - detach_start + 1
+    )
+    signal[detach_end + 1 : attach_start] = 4.0
+    signal[attach_start : attach_end + 1] = np.linspace(
+        4.0, contact_level[attach_end], attach_end - attach_start + 1
+    )
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+    _use_known_candidates(monkeypatch, candidates, contact_level)
+
+    config = ContactStateConfig(bslow_stable_offset_threshold=0.1)
+    result = decompose_contact_state_udeco(signal, fs, config)
+
+    required = {
+        "raw", "clean", "Bpilot", "fast_residual", "pilot_slope",
+        "transition_candidates", "candidate_score", "J_events", "contact_mask", "noncontact_mask",
+        "transition_mask", "uncertain_mask", "contact_weight", "state_confidence",
+        "Ucontact", "ucontact_synthetic_mask", "Bm_contact", "dBm_dt", "Bslow",
+        "bslow_update_mask", "P", "P_valid_mask", "J", "mode_gap_raw", "residual",
+    }
+    assert required <= result.keys()
+    assert [event["event_type"] for event in result["J_events"]] == ["detach", "attach"]
+    assert np.all(result["P"][result["noncontact_mask"]] == 0.0)
+    assert np.all(result["J"][attach_end + 1 :] == 0.0)
+    assert not result["bslow_update_mask"][detach_start : attach_end + 1].any()
+    assert np.ptp(result["Bslow"][detach_start - 1 : attach_end + 1]) == 0.0
+    reconstruction = result["J"] + result["P"] + result["Bslow"] + result["residual"]
+    np.testing.assert_allclose(reconstruction, result["clean"], atol=1e-12)
+    for key in required - {"transition_candidates", "J_events"}:
+        assert result[key].shape == signal.shape
+        assert np.isfinite(result[key]).all()
+
+
+def test_pressure_activity_remains_contact_and_is_not_moved_into_j(monkeypatch):
+    """压力活动即使带来边沿候选，也应保持 Contact 并保留在连续 P 中。"""
+    fs = 20.0
+    time = np.arange(int(42 * fs)) / fs
+    signal = np.full(time.size, 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(35 * fs), int(36 * fs)
+    signal[detach_start : detach_end + 1] = np.linspace(
+        10.0, 16.0, detach_end - detach_start + 1
+    )
+    gap = slice(detach_end + 1, attach_start)
+    signal[gap] = 16.0 + 0.8 * np.sin(2 * np.pi * 1.5 * time[gap])
+    signal[attach_start : attach_end + 1] = np.linspace(
+        16.0, 10.0, attach_end - attach_start + 1
+    )
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="up"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="down"),
+    ]
+    _use_known_candidates(monkeypatch, candidates, signal)
+
+    result = decompose_contact_state_udeco(signal, fs)
+
+    assert not result["J_events"]
+    assert not result["noncontact_mask"].any()
+    assert result["uncertain_mask"][detach_start : attach_end + 1].all()
+    assert np.all(result["J"] == 0.0)
+    assert np.max(np.abs(result["P"])) > 1.0
+
+
+def test_terminal_noncontact_freezes_bslow_and_uses_constant_ucontact(monkeypatch):
+    """高置信末尾脱离后，接触模态保持最近锚点，慢基线不再更新。"""
+    fs = 20.0
+    signal = np.full(int(40 * fs), 10.0)
+    detach_start, detach_end = int(35 * fs), int(35.1 * fs)
+    signal[detach_start : detach_end + 1] = np.linspace(
+        10.0, 3.0, detach_end - detach_start + 1
+    )
+    signal[detach_end + 1 :] = 3.0
+    candidates = [
+        _candidate(
+            detach_start,
+            detach_end,
+            fs,
+            event_type="detach",
+            direction="down",
+            confidence=0.95,
+        )
+    ]
+    _use_known_candidates(monkeypatch, candidates, signal)
+
+    result = decompose_contact_state_udeco(signal, fs)
+
+    assert [event["event_type"] for event in result["J_events"]] == ["detach"]
+    assert result["Ucontact"][detach_start:] == pytest.approx(10.0)
+    assert np.all(result["P"][result["noncontact_mask"]] == 0.0)
+    assert not result["bslow_update_mask"][detach_start:].any()
+    assert np.ptp(result["Bslow"][detach_start - 1 :]) == 0.0
+
+
+def test_two_decompositions_have_independent_outputs(monkeypatch):
+    """两路调用不共享事件列表或数组，且各自保持精确分解恒等式。"""
+    def simple_pilot(clean, fs, config):
+        return {
+            "Bpilot": clean.copy(),
+            "fast_residual": np.zeros_like(clean),
+            "pilot_slope": np.gradient(clean) * fs,
+        }
+
+    monkeypatch.setattr(contact_module, "estimate_pilot_trend", simple_pilot)
+    monkeypatch.setattr(
+        contact_module,
+        "detect_transition_candidates",
+        lambda clean, *_: (
+            [],
+            {"residual": np.zeros_like(clean), "scores": np.zeros_like(clean), "scales_s": []},
+        ),
+    )
+    signal2 = np.linspace(10.0, 10.001, 100)
+    signal3 = np.linspace(20.0, 20.001, 100)
+
+    result2 = decompose_contact_state_udeco(signal2, 20.0)
+    result3 = decompose_contact_state_udeco(signal3, 20.0)
+    result2["raw"][0] = -999.0
+    result2["transition_candidates"].append({"channel": 2})
+
+    assert result3["raw"][0] != -999.0
+    assert result3["transition_candidates"] == []
+    for result in (result2, result3):
+        reconstructed = result["J"] + result["P"] + result["Bslow"] + result["residual"]
+        np.testing.assert_allclose(reconstructed, result["clean"], atol=1e-12)
+
+
+def test_conditional_bslow_rejects_mismatched_diagnostics():
+    """最必要的形状错误应在基线接口处给出明确提示。"""
+    bm = np.ones(20)
+    state = {
+        "contact_mask": np.ones(20, dtype=bool),
+        "noncontact_mask": np.zeros(20, dtype=bool),
+        "transition_mask": np.zeros(20, dtype=bool),
+        "uncertain_mask": np.zeros(20, dtype=bool),
+    }
+    with pytest.raises(ValueError, match="等长"):
+        estimate_conditional_bslow(
+            bm,
+            state,
+            {"dBm_dt": np.zeros(19), "scores": np.zeros(20)},
+            20.0,
+            ContactStateConfig(),
+        )

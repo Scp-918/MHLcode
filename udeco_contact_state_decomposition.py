@@ -1,4 +1,4 @@
-"""接触状态分解的第一阶段：稳健预处理、试探趋势与转换候选。"""
+"""基于接触状态的 Udeco 单通道分解算法。"""
 
 from __future__ import annotations
 
@@ -31,6 +31,14 @@ class ContactStateConfig:
     max_dynamic_fraction: float = 0.15
     terminal_min_tail_s: float = 2.0
     downstream_min_segment_s: float = 0.25
+    contact_lowess_window_s: float = 3.0
+    contact_lowess_robust_iterations: int = 2
+    bslow_tau_s: float = 60.0
+    bslow_update_rate: float = 1.0
+    bslow_stable_edge_threshold: float = 3.5
+    bslow_stable_slope_threshold: float = 3e-4
+    bslow_stable_offset_threshold: float = 1e-3
+    j_smooth_window_s: float = 0.10
 
     def __post_init__(self) -> None:
         """在分析开始前拒绝没有物理时间意义的配置。"""
@@ -47,11 +55,20 @@ class ContactStateConfig:
             self.contact_anchor_window_s,
             self.terminal_min_tail_s,
             self.downstream_min_segment_s,
+            self.contact_lowess_window_s,
+            self.bslow_tau_s,
+            self.bslow_update_rate,
+            self.bslow_stable_edge_threshold,
+            self.bslow_stable_slope_threshold,
+            self.bslow_stable_offset_threshold,
+            self.j_smooth_window_s,
         )
         if any(not isinstance(value, Real) or not np.isfinite(value) or value <= 0 for value in positive):
             raise ValueError("配置中的时间和阈值必须为有限正数")
         if not isinstance(self.pilot_lowess_robust_iterations, int) or self.pilot_lowess_robust_iterations < 0:
             raise ValueError("LOWESS稳健迭代次数必须为非负整数")
+        if not isinstance(self.contact_lowess_robust_iterations, int) or self.contact_lowess_robust_iterations < 0:
+            raise ValueError("最终 LOWESS 稳健迭代次数必须为非负整数")
         if not 0 < self.attach_min_monotonicity <= 1:
             raise ValueError("单调性阈值必须在 (0, 1] 内")
         if not 0 < self.state_transition_confidence <= 1:
@@ -591,3 +608,170 @@ def reconstruct_contact_mode(
             synthetic[detach_start:] = True
 
     return {"Ucontact": output, "ucontact_synthetic_mask": synthetic}
+
+
+def estimate_contact_bm(
+    ucontact: np.ndarray,
+    fs: float,
+    config: ContactStateConfig,
+) -> dict:
+    """从接触模态重建信号估计最终中低频趋势 ``Bm_contact``。
+
+    这里的 LOWESS 只处理已修复非接触缺口的 ``Ucontact``，因此不会再依赖
+    易累积误差的 ``clean - J``。窗口决定保留的最短中尺度变化，稳健迭代则
+    降低残余离群点对局部回归的影响。
+    """
+    values = _validated_signal(ucontact, fs, config)
+    if values.size < 3:
+        raise ValueError("估计接触趋势至少需要三个采样点")
+
+    time = np.arange(values.size, dtype=float) / float(fs)
+    duration_s = values.size / float(fs)
+    fraction = min(
+        1.0,
+        max(3.0 / values.size, config.contact_lowess_window_s / duration_s),
+    )
+    bm_contact = np.asarray(
+        lowess(
+            values,
+            time,
+            frac=fraction,
+            it=config.contact_lowess_robust_iterations,
+            return_sorted=False,
+        ),
+        dtype=float,
+    )
+    return {
+        "Bm_contact": bm_contact,
+        "dBm_dt": np.gradient(bm_contact) * float(fs),
+    }
+
+
+def estimate_conditional_bslow(
+    bm_contact: np.ndarray,
+    state_result: dict,
+    diagnostics: dict,
+    fs: float,
+    config: ContactStateConfig,
+) -> dict:
+    """仅在真实、稳定接触点更新超慢基线。
+
+    非接触、转换、模糊判断和人工重建区均严格冻结。稳定接触点还需同时满足
+    边沿、趋势斜率和相对上一时刻慢基线的偏移阈值，避免真实压力被慢基线
+    逐渐吸收。
+    """
+    bm = _validated_signal(bm_contact, fs, config)
+    contact = np.asarray(state_result["contact_mask"], dtype=bool)
+    noncontact = np.asarray(state_result["noncontact_mask"], dtype=bool)
+    transition = np.asarray(state_result["transition_mask"], dtype=bool)
+    uncertain = np.asarray(state_result["uncertain_mask"], dtype=bool)
+    synthetic = np.asarray(
+        diagnostics.get("ucontact_synthetic_mask", np.zeros(bm.size, dtype=bool)),
+        dtype=bool,
+    )
+    slope = np.asarray(diagnostics["dBm_dt"], dtype=float)
+    edge_score = np.asarray(
+        diagnostics.get("edge_score", diagnostics.get("scores", np.zeros(bm.size))),
+        dtype=float,
+    )
+    arrays = (contact, noncontact, transition, uncertain, synthetic, slope, edge_score)
+    if any(values.shape != bm.shape for values in arrays):
+        raise ValueError("状态掩码和诊断数组必须与 Bm_contact 等长")
+
+    alpha = config.bslow_update_rate * (
+        1.0 - np.exp(-1.0 / (float(fs) * config.bslow_tau_s))
+    )
+    bslow = np.empty_like(bm)
+    update_mask = np.zeros(bm.size, dtype=bool)
+    bslow[0] = bm[0]
+
+    real_stable_contact = contact & ~noncontact & ~transition & ~uncertain & ~synthetic
+    for index in range(1, bm.size):
+        stable = (
+            real_stable_contact[index]
+            and abs(edge_score[index]) < config.bslow_stable_edge_threshold
+            and abs(slope[index]) < config.bslow_stable_slope_threshold
+            and abs(bm[index] - bslow[index - 1])
+            < config.bslow_stable_offset_threshold
+        )
+        if stable:
+            bslow[index] = bslow[index - 1] + alpha * (bm[index] - bslow[index - 1])
+            update_mask[index] = True
+        else:
+            bslow[index] = bslow[index - 1]
+
+    return {"Bslow": bslow, "bslow_update_mask": update_mask}
+
+
+def decompose_contact_state_udeco(
+    signal: np.ndarray,
+    fs: float,
+    config: ContactStateConfig | None = None,
+) -> dict:
+    """执行单路 Udeco 的完整接触状态分解。
+
+    每次调用都从原信号独立估计噪声、候选和状态；函数不保存跨通道状态，
+    因而可用同一接口分别处理 Udeco2 与 Udeco3。
+    """
+    config = ContactStateConfig() if config is None else config
+    raw = _validated_signal(signal, fs, config).copy()
+    clean = hampel_filter(raw, fs, config)
+    pilot = estimate_pilot_trend(clean, fs, config)
+    candidates, candidate_diagnostics = detect_transition_candidates(
+        clean, pilot["Bpilot"], fs, config
+    )
+    state = infer_contact_states(clean, pilot["Bpilot"], candidates, fs, config)
+    reconstruction = reconstruct_contact_mode(clean, state, fs, config)
+    medium = estimate_contact_bm(reconstruction["Ucontact"], fs, config)
+
+    slow_diagnostics = {
+        "dBm_dt": medium["dBm_dt"],
+        "edge_score": candidate_diagnostics["scores"],
+        "ucontact_synthetic_mask": reconstruction["ucontact_synthetic_mask"],
+    }
+    slow = estimate_conditional_bslow(
+        medium["Bm_contact"], state, slow_diagnostics, fs, config
+    )
+
+    p_candidate = medium["Bm_contact"] - slow["Bslow"]
+    p = p_candidate * state["contact_weight"]
+    p[state["noncontact_mask"]] = 0.0
+    p_valid_mask = (
+        state["contact_mask"]
+        & ~state["transition_mask"]
+        & ~state["uncertain_mask"]
+        & ~reconstruction["ucontact_synthetic_mask"]
+    )
+
+    # J 只描述当前非接触模态与边沿，不累计历史阶跃。短中值窗可避免把
+    # 高频测量噪声全部塞进 J；剩余部分自然进入 residual。
+    mode_active = state["noncontact_mask"] | state["transition_mask"]
+    mode_signal = clean - slow["Bslow"] - p
+    smooth_size = max(1, int(round(config.j_smooth_window_s * fs)) | 1)
+    smooth_mode_signal = median_filter(mode_signal, size=smooth_size, mode="nearest")
+    j = np.zeros_like(clean)
+    j[mode_active] = smooth_mode_signal[mode_active]
+    residual = clean - j - p - slow["Bslow"]
+
+    return {
+        "raw": raw,
+        "clean": clean,
+        **pilot,
+        "transition_candidates": state["candidates"],
+        "candidate_score": candidate_diagnostics["scores"],
+        "J_events": state["J_events"],
+        "contact_mask": state["contact_mask"],
+        "noncontact_mask": state["noncontact_mask"],
+        "transition_mask": state["transition_mask"],
+        "uncertain_mask": state["uncertain_mask"],
+        "contact_weight": state["contact_weight"],
+        "state_confidence": state["state_confidence"],
+        **reconstruction,
+        **medium,
+        **slow,
+        "P": p,
+        "P_valid_mask": p_valid_mask,
+        "J": j,
+        "mode_gap_raw": clean - reconstruction["Ucontact"],
+        "residual": residual,
+    }
