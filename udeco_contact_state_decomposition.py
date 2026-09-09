@@ -25,8 +25,11 @@ class ContactStateConfig:
     detach_peak_slope_z: float = 3.0
     attach_min_monotonicity: float = 0.70
     initial_contact_s: float = 30.0
-    state_min_dwell_s: float = 1.0
+    state_min_dwell_s: float = 0.5
     state_transition_confidence: float = 0.50
+    contact_anchor_window_s: float = 1.0
+    max_dynamic_fraction: float = 0.15
+    terminal_min_tail_s: float = 2.0
     downstream_min_segment_s: float = 0.25
 
     def __post_init__(self) -> None:
@@ -41,6 +44,8 @@ class ContactStateConfig:
             self.detach_peak_slope_z,
             self.initial_contact_s,
             self.state_min_dwell_s,
+            self.contact_anchor_window_s,
+            self.terminal_min_tail_s,
             self.downstream_min_segment_s,
         )
         if any(not isinstance(value, Real) or not np.isfinite(value) or value <= 0 for value in positive):
@@ -51,6 +56,8 @@ class ContactStateConfig:
             raise ValueError("单调性阈值必须在 (0, 1] 内")
         if not 0 < self.state_transition_confidence <= 1:
             raise ValueError("状态转换置信度阈值必须在 (0, 1] 内")
+        if not isinstance(self.max_dynamic_fraction, Real) or not np.isfinite(self.max_dynamic_fraction) or not 0 <= self.max_dynamic_fraction <= 1:
+            raise ValueError("动态样本占比阈值必须在 [0, 1] 内")
         if not isinstance(self.candidate_scales, tuple) or not self.candidate_scales or any(
             not isinstance(scale, Real) or not np.isfinite(scale) or scale <= 0
             for scale in self.candidate_scales
@@ -247,3 +254,340 @@ def detect_transition_candidates(
         )
     candidates.sort(key=lambda candidate: candidate["start_index"])
     return candidates, {"residual": residual, "scores": scores, "scales_s": contributing_scales}
+
+
+def _candidate_bounds(candidate: dict, size: int) -> tuple[int, int]:
+    """返回限制在信号范围内的闭区间候选边界。"""
+    try:
+        start = int(candidate["start_index"])
+        end = int(candidate["end_index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("候选必须包含有效的 start_index 和 end_index") from exc
+    if start < 0 or end < start or end >= size:
+        raise ValueError("候选边界必须位于信号范围内且顺序有效")
+    return start, end
+
+
+def _validate_candidate(candidate: dict, size: int) -> None:
+    """只校验状态推断直接依赖的候选字段。"""
+    _candidate_bounds(candidate, size)
+    if candidate.get("candidate_type") not in {"detach", "attach", "ambiguous"}:
+        raise ValueError("候选 candidate_type 必须是 detach、attach 或 ambiguous")
+    if candidate.get("direction") not in {"up", "down"}:
+        raise ValueError("候选 direction 必须是 up 或 down")
+    duration = candidate.get("duration_s")
+    duration_valid = (
+        isinstance(duration, Real)
+        and not isinstance(duration, bool)
+        and np.isfinite(duration)
+        and duration >= 0
+    )
+    if not duration_valid:
+        raise ValueError("候选 duration_s 必须是有限非负数")
+    confidence = candidate.get("confidence")
+    confidence_valid = (
+        isinstance(confidence, Real)
+        and not isinstance(confidence, bool)
+        and np.isfinite(confidence)
+        and 0 <= confidence <= 1
+    )
+    if not confidence_valid:
+        raise ValueError("候选 confidence 必须是 [0, 1] 内的有限数")
+
+
+def _pilot_slope_activity(bpilot: np.ndarray, fs: float, reference_end: int) -> np.ndarray:
+    """以强制接触参考段的稳健斜率背景标记全段趋势活动。"""
+    slope = np.gradient(bpilot) * float(fs)
+    reference_slope = slope[:reference_end]
+    center = float(np.median(reference_slope))
+    scale = 1.4826 * _mad(reference_slope)
+    numerical_floor = np.sqrt(np.finfo(float).eps) * max(
+        1.0,
+        float(np.median(np.abs(bpilot[:reference_end]))) * float(fs),
+    )
+    threshold = max(3.0 * scale, numerical_floor)
+    return np.abs(slope - center) > threshold
+
+
+def _activity_fraction(activity: np.ndarray) -> float:
+    """返回布尔窗口中的动态样本占比；空窗口视作不可靠。"""
+    return float(np.mean(activity)) if activity.size else 1.0
+
+
+def _residual_noise_limit(clean: np.ndarray, bpilot: np.ndarray, reference_end: int) -> float:
+    """由强制接触参考段给出 clean-Bpilot 的稳健锚窗噪声上限。"""
+    reference = clean[:reference_end] - bpilot[:reference_end]
+    reference_scale = 1.4826 * _mad(reference)
+    reference_level = max(1.0, float(np.median(np.abs(clean[:reference_end]))))
+    relative_floor = 0.05 * reference_level
+    return max(3.0 * reference_scale, relative_floor)
+
+
+def _anchor_residual_is_stable(
+    clean: np.ndarray,
+    bpilot: np.ndarray,
+    start: int,
+    end: int,
+    required_samples: int,
+    noise_limit: float,
+) -> bool:
+    """检查实际重建锚窗的局部残差噪声是否可靠。"""
+    residual = clean[start:end] - bpilot[start:end]
+    return residual.size == required_samples and 1.4826 * _mad(residual) <= noise_limit
+
+
+def infer_contact_states(
+    clean: np.ndarray,
+    bpilot: np.ndarray,
+    candidates: list[dict],
+    fs: float,
+    config: ContactStateConfig,
+) -> dict:
+    """以保守配对规则从转换候选推断接触、转换和非接触状态。"""
+    values = _validated_signal(clean, fs, config)
+    baseline = _validated_signal(bpilot, fs, config)
+    if baseline.shape != values.shape:
+        raise ValueError("clean 和 bpilot 必须具有相同长度")
+    if values.size < 2:
+        raise ValueError("状态推断至少需要两个采样点")
+    if not isinstance(candidates, list):
+        raise TypeError("candidates 必须是列表")
+
+    updated = [dict(candidate) for candidate in candidates]
+    for candidate in updated:
+        _validate_candidate(candidate, values.size)
+    updated.sort(key=lambda candidate: _candidate_bounds(candidate, values.size)[0])
+    contact_mask = np.ones(values.size, dtype=bool)
+    noncontact_mask = np.zeros(values.size, dtype=bool)
+    transition_mask = np.zeros(values.size, dtype=bool)
+    uncertain_mask = np.zeros(values.size, dtype=bool)
+    contact_weight = np.ones(values.size, dtype=float)
+    state_confidence = np.ones(values.size, dtype=float)
+    events: list[dict] = []
+    initial_end = min(values.size, int(np.ceil(config.initial_contact_s * fs)))
+    pilot_activity = _pilot_slope_activity(baseline, fs, initial_end)
+    anchor_samples = max(1, int(round(config.contact_anchor_window_s * fs)))
+    residual_noise_limit = _residual_noise_limit(values, baseline, initial_end)
+
+    index = 0
+    while index < len(updated):
+        detach = updated[index]
+        detach_start, detach_end = _candidate_bounds(detach, values.size)
+        detach["accepted"] = False
+        if detach.get("candidate_type") != "detach":
+            detach["rejection_reason"] = "not_a_tentative_detach"
+            uncertain_mask[detach_start : detach_end + 1] = True
+            state_confidence[detach_start : detach_end + 1] = 0.0
+            index += 1
+            continue
+        if detach_start < initial_end:
+            detach["rejection_reason"] = "initial_contact_forced"
+            uncertain_mask[detach_start : detach_end + 1] = True
+            state_confidence[detach_start : detach_end + 1] = 0.0
+            index += 1
+            continue
+        if index + 1 >= len(updated):
+            before_activity = pilot_activity[max(0, detach_start - anchor_samples) : detach_start]
+            tail_activity = pilot_activity[detach_end + 1 :]
+            tail_s = (values.size - detach_end - 1) / float(fs)
+            before_start = max(0, detach_start - anchor_samples)
+            terminal_ok = (
+                float(detach.get("confidence", 0.0)) >= config.state_transition_confidence
+                and tail_s >= config.terminal_min_tail_s
+                and _anchor_residual_is_stable(
+                    values,
+                    baseline,
+                    before_start,
+                    detach_start,
+                    anchor_samples,
+                    residual_noise_limit,
+                )
+                and _activity_fraction(before_activity) <= config.max_dynamic_fraction
+                and _activity_fraction(tail_activity) <= config.max_dynamic_fraction
+            )
+            if terminal_ok:
+                detach["accepted"] = True
+                detach["rejection_reason"] = None
+                transition_mask[detach_start : detach_end + 1] = True
+                noncontact_mask[detach_end + 1 :] = True
+                contact_mask[detach_start:] = False
+                contact_weight[detach_start : detach_end + 1] = np.linspace(
+                    1.0, 0.0, detach_end - detach_start + 1
+                )
+                contact_weight[detach_end + 1 :] = 0.0
+                state_confidence[detach_start:] = float(detach.get("confidence", 0.0))
+                events.append({**detach, "event_type": "detach"})
+            else:
+                detach["rejection_reason"] = "unpaired_or_unstable_terminal_detach"
+                uncertain_mask[detach_start : detach_end + 1] = True
+                state_confidence[detach_start : detach_end + 1] = 0.0
+            index += 1
+            continue
+
+        attach = updated[index + 1]
+        attach_start, attach_end = _candidate_bounds(attach, values.size)
+        dwell_s = (attach_start - detach_end) / float(fs)
+        if attach.get("candidate_type") != "attach":
+            detach["rejection_reason"] = "missing_slower_opposite_attach"
+            uncertain_mask[detach_start : detach_end + 1] = True
+            state_confidence[detach_start : detach_end + 1] = 0.0
+            index += 1
+            continue
+        pair_confidence = min(float(detach["confidence"]), float(attach["confidence"]))
+        if pair_confidence < config.state_transition_confidence:
+            detach["rejection_reason"] = "low_transition_confidence"
+            attach["accepted"] = False
+            attach["rejection_reason"] = "low_transition_confidence"
+            uncertain_mask[detach_start : attach_end + 1] = True
+            state_confidence[detach_start : attach_end + 1] = 0.0
+            index += 2
+            continue
+        if attach.get("direction") == detach.get("direction"):
+            pair_rejection = "same_direction_attach"
+        elif float(attach.get("duration_s", 0.0)) <= float(detach.get("duration_s", 0.0)):
+            pair_rejection = "attach_not_slower"
+        elif dwell_s < config.state_min_dwell_s:
+            pair_rejection = "insufficient_dwell"
+        else:
+            pair_rejection = None
+        if pair_rejection is not None:
+            detach["rejection_reason"] = pair_rejection
+            attach["accepted"] = False
+            attach["rejection_reason"] = pair_rejection
+            uncertain_mask[detach_start : attach_end + 1] = True
+            state_confidence[detach_start : attach_end + 1] = 0.0
+            index += 2
+            continue
+
+        before_activity = pilot_activity[max(0, detach_start - anchor_samples) : detach_start]
+        after_activity = pilot_activity[
+            attach_end + 1 : min(values.size, attach_end + 1 + anchor_samples)
+        ]
+        before_start = max(0, detach_start - anchor_samples)
+        after_end = min(values.size, attach_end + 1 + anchor_samples)
+        anchors_stable = (
+            before_activity.size == anchor_samples
+            and after_activity.size == anchor_samples
+            and _activity_fraction(before_activity) <= config.max_dynamic_fraction
+            and _activity_fraction(after_activity) <= config.max_dynamic_fraction
+            and _anchor_residual_is_stable(
+                values,
+                baseline,
+                before_start,
+                detach_start,
+                anchor_samples,
+                residual_noise_limit,
+            )
+            and _anchor_residual_is_stable(
+                values,
+                baseline,
+                attach_end + 1,
+                after_end,
+                anchor_samples,
+                residual_noise_limit,
+            )
+        )
+        if not anchors_stable:
+            detach["rejection_reason"] = "unstable_contact_anchor"
+            attach["accepted"] = False
+            attach["rejection_reason"] = "unstable_contact_anchor"
+            uncertain_mask[detach_start : attach_end + 1] = True
+            state_confidence[detach_start : attach_end + 1] = 0.0
+            index += 2
+            continue
+
+        gap_activity = pilot_activity[detach_end + 1 : attach_start]
+        dynamic_fraction = _activity_fraction(gap_activity)
+        if dynamic_fraction > config.max_dynamic_fraction:
+            detach["rejection_reason"] = "excessive_pilot_slope_activity"
+            attach["accepted"] = False
+            attach["rejection_reason"] = "excessive_pilot_slope_activity"
+            uncertain_mask[detach_start : attach_end + 1] = True
+            state_confidence[detach_start : attach_end + 1] = 0.0
+            index += 2
+            continue
+
+        detach["accepted"] = True
+        detach["rejection_reason"] = None
+        attach["accepted"] = True
+        attach["rejection_reason"] = None
+        transition_mask[detach_start : detach_end + 1] = True
+        transition_mask[attach_start : attach_end + 1] = True
+        noncontact_mask[detach_end + 1 : attach_start] = True
+        contact_mask[detach_start : attach_end + 1] = False
+        contact_weight[detach_start : detach_end + 1] = np.linspace(
+            1.0, 0.0, detach_end - detach_start + 1
+        )
+        contact_weight[detach_end + 1 : attach_start] = 0.0
+        contact_weight[attach_start : attach_end + 1] = np.linspace(
+            0.0, 1.0, attach_end - attach_start + 1
+        )
+        confidence = min(float(detach.get("confidence", 0.0)), float(attach.get("confidence", 0.0)))
+        state_confidence[detach_start : attach_end + 1] = confidence
+        events.extend(
+            (
+                {**detach, "event_type": "detach"},
+                {**attach, "event_type": "attach"},
+            )
+        )
+        index += 2
+
+    contact_mask[:initial_end] = True
+    noncontact_mask[:initial_end] = False
+    transition_mask[:initial_end] = False
+    contact_weight[:initial_end] = 1.0
+    return {
+        "contact_mask": contact_mask,
+        "noncontact_mask": noncontact_mask,
+        "transition_mask": transition_mask,
+        "uncertain_mask": uncertain_mask,
+        "contact_weight": contact_weight,
+        "state_confidence": state_confidence,
+        "J_events": events,
+        "candidates": updated,
+    }
+
+
+def reconstruct_contact_mode(
+    clean: np.ndarray,
+    state_result: dict,
+    fs: float,
+    config: ContactStateConfig,
+) -> dict:
+    """以局部稳健接触锚点填补已接受的内部非接触区间。"""
+    values = _validated_signal(clean, fs, config)
+    if not isinstance(state_result, dict):
+        raise TypeError("state_result 必须是字典")
+    output = values.copy()
+    synthetic = np.zeros(values.size, dtype=bool)
+    events = state_result.get("J_events", [])
+    anchor_samples = max(1, int(round(config.contact_anchor_window_s * fs)))
+
+    event_index = 0
+    while event_index + 1 < len(events):
+        detach = events[event_index]
+        attach = events[event_index + 1]
+        if detach.get("event_type") != "detach" or attach.get("event_type") != "attach":
+            event_index += 1
+            continue
+        detach_start, _ = _candidate_bounds(detach, values.size)
+        _, attach_end = _candidate_bounds(attach, values.size)
+        before = values[max(0, detach_start - anchor_samples) : detach_start]
+        after = values[attach_end + 1 : min(values.size, attach_end + 1 + anchor_samples)]
+        if before.size and after.size:
+            output[detach_start : attach_end + 1] = np.linspace(
+                float(np.median(before)),
+                float(np.median(after)),
+                attach_end - detach_start + 1,
+            )
+            synthetic[detach_start : attach_end + 1] = True
+        event_index += 2
+
+    if events and events[-1].get("event_type") == "detach":
+        detach_start, _ = _candidate_bounds(events[-1], values.size)
+        before = values[max(0, detach_start - anchor_samples) : detach_start]
+        if before.size:
+            output[detach_start:] = float(np.median(before))
+            synthetic[detach_start:] = True
+
+    return {"Ucontact": output, "ucontact_synthetic_mask": synthetic}

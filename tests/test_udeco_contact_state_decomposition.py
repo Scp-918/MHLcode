@@ -8,6 +8,8 @@ from udeco_contact_state_decomposition import (
     detect_transition_candidates,
     estimate_pilot_trend,
     hampel_filter,
+    infer_contact_states,
+    reconstruct_contact_mode,
 )
 
 
@@ -28,6 +30,366 @@ def _synthetic_contact_signal(fs: float = 100.0) -> tuple[np.ndarray, int, int]:
     signal += rng.normal(0.0, 0.01, size=time.size)
     signal[int(5.0 * fs)] += 4.0
     return signal, detach_start, attach_start
+
+
+def _candidate(
+    start: int,
+    end: int,
+    fs: float,
+    *,
+    event_type: str,
+    direction: str,
+    confidence: float = 0.95,
+) -> dict:
+    """构造与阶段一公开候选格式一致的确定性测试候选。"""
+    return {
+        "start_index": start,
+        "end_index": end,
+        "start_s": start / fs,
+        "end_s": end / fs,
+        "duration_s": (end - start) / fs,
+        "delta": -6.0 if direction == "down" else 6.0,
+        "direction": direction,
+        "candidate_type": event_type,
+        "peak_slope": 60.0,
+        "peak_slope_z": 8.0,
+        "monotonicity": 1.0,
+        "confidence": confidence,
+        "accepted": False,
+        "rejection_reason": "awaiting_state_inference",
+    }
+
+
+def test_complete_detach_gap_attach_pair_is_accepted_and_inpainted():
+    """若保守配对或锚点插值缺失，完整稳定的内部非接触段会被漏掉。"""
+    fs = 20.0
+    clean = np.full(int(42 * fs), 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(35 * fs), int(36 * fs)
+    clean[detach_start : detach_end + 1] = np.linspace(10.0, 4.0, detach_end - detach_start + 1)
+    clean[detach_end + 1 : attach_start] = 4.0
+    clean[attach_start : attach_end + 1] = np.linspace(4.0, 10.0, attach_end - attach_start + 1)
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+
+    state = infer_contact_states(clean, np.full_like(clean, 10.0), candidates, fs, ContactStateConfig())
+    reconstruction = reconstruct_contact_mode(clean, state, fs, ContactStateConfig())
+
+    assert [event["event_type"] for event in state["J_events"]] == ["detach", "attach"]
+    assert all(candidate["accepted"] for candidate in state["candidates"])
+    assert state["contact_mask"][: int(30 * fs)].all()
+    assert state["noncontact_mask"][detach_end + 1 : attach_start].all()
+    assert state["transition_mask"][detach_start : detach_end + 1].all()
+    assert state["transition_mask"][attach_start : attach_end + 1].all()
+    assert state["contact_weight"][detach_start] == pytest.approx(1.0)
+    assert state["contact_weight"][detach_end] == pytest.approx(0.0)
+    assert state["contact_weight"][attach_start] == pytest.approx(0.0)
+    assert state["contact_weight"][attach_end] == pytest.approx(1.0)
+    assert reconstruction["ucontact_synthetic_mask"][detach_start : attach_end + 1].all()
+    assert reconstruction["Ucontact"][detach_start : attach_end + 1] == pytest.approx(10.0)
+
+
+def test_dynamic_pressure_hold_remains_contact_and_uncertain():
+    """若忽略间隙内的试探斜率活动，动态按压会被误判成非接触。"""
+    fs = 20.0
+    time = np.arange(int(42 * fs)) / fs
+    clean = np.full(time.size, 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(35 * fs), int(36 * fs)
+    hold = slice(detach_end + 1, attach_start)
+    clean[detach_start : detach_end + 1] = np.linspace(10.0, 16.0, detach_end - detach_start + 1)
+    clean[hold] = 16.0 + 0.8 * np.sin(2 * np.pi * 1.5 * time[hold])
+    clean[attach_start : attach_end + 1] = np.linspace(16.0, 10.0, attach_end - attach_start + 1)
+    bpilot = clean.copy()
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="up"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="down"),
+    ]
+
+    state = infer_contact_states(clean, bpilot, candidates, fs, ContactStateConfig())
+
+    assert not state["J_events"]
+    assert state["contact_mask"].all()
+    assert not state["noncontact_mask"].any()
+    assert state["uncertain_mask"][detach_start : attach_end + 1].all()
+    assert all(not candidate["accepted"] for candidate in state["candidates"])
+    assert all(candidate["rejection_reason"] for candidate in state["candidates"])
+
+
+def test_high_confidence_terminal_detach_uses_constant_contact_hold():
+    """若终端脱离未获支持或外推斜率，稳定尾段的接触模式会丢失或漂移。"""
+    fs = 20.0
+    clean = np.full(int(40 * fs), 10.0)
+    detach_start, detach_end = int(35 * fs), int(35.1 * fs)
+    clean[detach_start : detach_end + 1] = np.linspace(10.0, 3.0, detach_end - detach_start + 1)
+    clean[detach_end + 1 :] = 3.0
+    candidates = [
+        _candidate(
+            detach_start,
+            detach_end,
+            fs,
+            event_type="detach",
+            direction="down",
+            confidence=0.95,
+        )
+    ]
+
+    config = ContactStateConfig()
+    state = infer_contact_states(clean, clean, candidates, fs, config)
+    reconstruction = reconstruct_contact_mode(clean, state, fs, config)
+
+    assert [event["event_type"] for event in state["J_events"]] == ["detach"]
+    assert state["candidates"][0]["accepted"] is True
+    assert state["transition_mask"][detach_start : detach_end + 1].all()
+    assert state["noncontact_mask"][detach_end + 1 :].all()
+    assert reconstruction["ucontact_synthetic_mask"][detach_start:].all()
+    assert reconstruction["Ucontact"][detach_start:] == pytest.approx(10.0)
+
+
+def test_contact_recovery_ends_synthesis_without_cumulative_offset():
+    """若恢复后继续合成或叠加锚点差，后续真实接触波形会产生累计偏移。"""
+    fs = 20.0
+    time = np.arange(int(42 * fs)) / fs
+    clean = np.full(time.size, 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(34 * fs), int(35 * fs)
+    clean[detach_start : detach_end + 1] = np.linspace(10.0, 4.0, detach_end - detach_start + 1)
+    clean[detach_end + 1 : attach_start] = 4.0
+    clean[attach_start : attach_end + 1] = np.linspace(4.0, 12.0, attach_end - attach_start + 1)
+    clean[attach_end + 1 :] = 12.0 + 0.2 * np.sin(2 * np.pi * 0.5 * time[attach_end + 1 :])
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+
+    config = ContactStateConfig()
+    state = infer_contact_states(clean, np.full_like(clean, 10.0), candidates, fs, config)
+    reconstruction = reconstruct_contact_mode(clean, state, fs, config)
+
+    assert state["contact_mask"][attach_end + 1 :].all()
+    assert reconstruction["ucontact_synthetic_mask"][detach_start : attach_end + 1].all()
+    assert not reconstruction["ucontact_synthetic_mask"][attach_end + 1 :].any()
+    np.testing.assert_array_equal(reconstruction["Ucontact"][attach_end + 1 :], clean[attach_end + 1 :])
+
+
+def test_dynamic_contact_anchor_rejects_otherwise_complete_pair():
+    """若接触锚窗不稳定仍接受配对，重建会把动态接触误当作锚点。"""
+    fs = 20.0
+    time = np.arange(int(42 * fs)) / fs
+    clean = np.full(time.size, 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(35 * fs), int(36 * fs)
+    before_anchor = slice(detach_start - int(fs), detach_start)
+    clean[before_anchor] += 0.8 * np.sin(2 * np.pi * 2.0 * time[before_anchor])
+    clean[detach_start : detach_end + 1] = np.linspace(10.0, 4.0, detach_end - detach_start + 1)
+    clean[detach_end + 1 : attach_start] = 4.0
+    clean[attach_start : attach_end + 1] = np.linspace(4.0, 10.0, attach_end - attach_start + 1)
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+
+    state = infer_contact_states(clean, clean, candidates, fs, ContactStateConfig())
+    reconstruction = reconstruct_contact_mode(clean, state, fs, ContactStateConfig())
+
+    assert not state["J_events"]
+    assert state["contact_mask"].all()
+    assert state["uncertain_mask"][detach_start : attach_end + 1].all()
+    assert {candidate["rejection_reason"] for candidate in state["candidates"]} == {
+        "unstable_contact_anchor"
+    }
+    assert not reconstruction["ucontact_synthetic_mask"].any()
+    np.testing.assert_array_equal(reconstruction["Ucontact"], clean)
+
+
+def test_clean_residual_oscillation_rejects_pair_with_flat_pilot_anchor():
+    """若只检查平坦 Bpilot，剧烈振荡的 clean 锚窗会被错误用于合成。"""
+    fs = 20.0
+    time = np.arange(int(42 * fs)) / fs
+    clean = np.full(time.size, 10.0)
+    bpilot = np.full_like(clean, 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(35 * fs), int(36 * fs)
+    before_anchor = slice(detach_start - int(fs), detach_start)
+    clean[before_anchor] += 3.0 * np.sin(2 * np.pi * 4.0 * time[before_anchor])
+    clean[detach_start : detach_end + 1] = np.linspace(10.0, 4.0, detach_end - detach_start + 1)
+    clean[detach_end + 1 : attach_start] = 4.0
+    clean[attach_start : attach_end + 1] = np.linspace(4.0, 10.0, attach_end - attach_start + 1)
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+
+    config = ContactStateConfig()
+    state = infer_contact_states(clean, bpilot, candidates, fs, config)
+    reconstruction = reconstruct_contact_mode(clean, state, fs, config)
+
+    assert not state["J_events"]
+    assert state["contact_mask"].all()
+    assert state["uncertain_mask"][detach_start : attach_end + 1].all()
+    assert {candidate["rejection_reason"] for candidate in state["candidates"]} == {
+        "unstable_contact_anchor"
+    }
+    assert not reconstruction["ucontact_synthetic_mask"].any()
+    np.testing.assert_array_equal(reconstruction["Ucontact"], clean)
+
+
+def test_long_dynamic_gap_cannot_raise_its_own_pilot_activity_threshold():
+    """若用整段 slope 校准，长动态会抬高阈值并把自身错误判成稳定 gap。"""
+    fs = 20.0
+    time = np.arange(int(140 * fs)) / fs
+    bpilot = np.full(time.size, 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(130 * fs), int(131 * fs)
+    gap = slice(detach_end + 1, attach_start)
+    bpilot[gap] += np.sin(2 * np.pi * time[gap])
+    clean = bpilot.copy()
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+
+    state = infer_contact_states(clean, bpilot, candidates, fs, ContactStateConfig())
+
+    assert not state["J_events"]
+    assert state["contact_mask"].all()
+    assert state["uncertain_mask"][detach_start : attach_end + 1].all()
+    assert {candidate["rejection_reason"] for candidate in state["candidates"]} == {
+        "excessive_pilot_slope_activity"
+    }
+
+
+@pytest.mark.parametrize(
+    ("attach_offset", "attach_duration", "attach_direction"),
+    [
+        pytest.param(0.45, 1.0, "up", id="below-minimum-dwell"),
+        pytest.param(2.0, 1.0, "down", id="not-opposite-direction"),
+        pytest.param(2.0, 0.05, "up", id="attach-not-slower"),
+    ],
+)
+def test_rejected_pair_marks_full_candidate_span_uncertain(
+    attach_offset: float,
+    attach_duration: float,
+    attach_direction: str,
+):
+    """若配对门槛失败只标事件局部，中间模糊跨度会被错误视作稳定 Contact。"""
+    fs = 20.0
+    clean = np.full(int(40 * fs), 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start = detach_end + int(round(attach_offset * fs))
+    attach_end = attach_start + int(round(attach_duration * fs))
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(
+            attach_start,
+            attach_end,
+            fs,
+            event_type="attach",
+            direction=attach_direction,
+        ),
+    ]
+
+    state = infer_contact_states(clean, clean, candidates, fs, ContactStateConfig())
+
+    assert not state["J_events"]
+    assert state["contact_mask"].all()
+    assert not state["noncontact_mask"].any()
+    assert state["uncertain_mask"][detach_start : attach_end + 1].all()
+    assert all(candidate["rejection_reason"] for candidate in state["candidates"])
+
+
+def test_pair_at_exact_half_second_dwell_is_accepted():
+    """若 dwell 少算一个采样间隔，恰好 0.5 秒的合法下限会被误拒。"""
+    fs = 20.0
+    clean = np.full(int(40 * fs), 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = detach_end + int(0.5 * fs), detach_end + int(1.5 * fs)
+    clean[detach_start : detach_end + 1] = np.linspace(10.0, 4.0, detach_end - detach_start + 1)
+    clean[detach_end + 1 : attach_start] = 4.0
+    clean[attach_start : attach_end + 1] = np.linspace(4.0, 10.0, attach_end - attach_start + 1)
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+
+    state = infer_contact_states(clean, np.full_like(clean, 10.0), candidates, fs, ContactStateConfig())
+
+    assert [event["event_type"] for event in state["J_events"]] == ["detach", "attach"]
+
+
+def test_internal_pair_rejects_when_either_transition_has_low_confidence():
+    """若只凭形态接受低置信转换，内部非接触区间会被过度推断。"""
+    fs = 20.0
+    clean = np.full(int(40 * fs), 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    attach_start, attach_end = int(34 * fs), int(35 * fs)
+    candidates = [
+        _candidate(
+            detach_start,
+            detach_end,
+            fs,
+            event_type="detach",
+            direction="down",
+            confidence=0.49,
+        ),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+
+    state = infer_contact_states(clean, clean, candidates, fs, ContactStateConfig())
+
+    assert not state["J_events"]
+    assert state["contact_mask"].all()
+    assert state["uncertain_mask"][detach_start : attach_end + 1].all()
+    assert {candidate["rejection_reason"] for candidate in state["candidates"]} == {
+        "low_transition_confidence"
+    }
+
+
+def test_state_inference_rejects_signal_too_short_for_gradient():
+    """若不在接口处检查长度，调用者只会收到 NumPy 的底层 gradient 异常。"""
+    with pytest.raises(ValueError, match="至少需要两个采样点"):
+        infer_contact_states(
+            np.array([1.0]),
+            np.array([1.0]),
+            [],
+            20.0,
+            ContactStateConfig(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("candidate_type", "other"),
+        ("direction", "sideways"),
+        ("duration_s", -0.1),
+        ("duration_s", np.nan),
+        ("confidence", 1.1),
+        ("confidence", np.nan),
+    ],
+)
+def test_state_inference_rejects_invalid_core_candidate_values(field, value):
+    """若核心候选字段未校验，状态机可能静默接受无物理意义的转换。"""
+    fs = 20.0
+    candidate = _candidate(
+        int(32 * fs),
+        int(32.1 * fs),
+        fs,
+        event_type="detach",
+        direction="down",
+    )
+    candidate[field] = value
+
+    with pytest.raises(ValueError, match="候选"):
+        infer_contact_states(
+            np.full(int(40 * fs), 10.0),
+            np.full(int(40 * fs), 10.0),
+            [candidate],
+            fs,
+            ContactStateConfig(),
+        )
 
 
 def test_hampel_replaces_an_isolated_spike_with_local_value():
