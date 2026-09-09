@@ -109,6 +109,28 @@ def test_complete_detach_gap_attach_pair_is_accepted_and_inpainted():
     assert reconstruction["Ucontact"][detach_start : attach_end + 1] == pytest.approx(10.0)
 
 
+def test_tentative_pair_search_skips_an_intervening_detach_candidate():
+    """非接触区内的短噪声候选不应挡住前后完整的 detach→attach 证据。"""
+    fs = 20.0
+    clean = np.full(int(42 * fs), 10.0)
+    detach_start, detach_end = int(32 * fs), int(32.1 * fs)
+    noise_start, noise_end = int(33 * fs), int(33.05 * fs)
+    attach_start, attach_end = int(35 * fs), int(36 * fs)
+    clean[detach_start : detach_end + 1] = np.linspace(10.0, 4.0, detach_end - detach_start + 1)
+    clean[detach_end + 1 : attach_start] = 4.0
+    clean[attach_start : attach_end + 1] = np.linspace(4.0, 10.0, attach_end - attach_start + 1)
+    candidates = [
+        _candidate(detach_start, detach_end, fs, event_type="detach", direction="down"),
+        _candidate(noise_start, noise_end, fs, event_type="detach", direction="up", confidence=0.70),
+        _candidate(attach_start, attach_end, fs, event_type="attach", direction="up"),
+    ]
+
+    state = infer_contact_states(clean, np.full_like(clean, 10.0), candidates, fs, ContactStateConfig())
+
+    assert [event["event_type"] for event in state["J_events"]] == ["detach", "attach"]
+    assert state["noncontact_mask"][detach_end + 1 : attach_start].all()
+
+
 def test_dynamic_pressure_hold_remains_contact_and_uncertain():
     """若忽略间隙内的试探斜率活动，动态按压会被误判成非接触。"""
     fs = 20.0
