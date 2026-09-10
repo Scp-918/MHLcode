@@ -28,12 +28,30 @@ class CascadeStateConfig:
     detach_direction: str = "up"
     detach_max_points: int = 4
     detach_min_snr: float = 5.0
+    detach_min_relative_amplitude: float = 0.03
+    detach_pre_level_fraction: float = -0.20
     attach_direction: str = "down"
     attach_min_points: int = 5
     attach_min_monotonicity: float = 0.65
     attach_min_snr: float = 4.0
+    attach_min_relative_amplitude: float = 0.01
     edge_min_persistence: float = 0.60
     edge_asymmetry_ratio: float = 2.0
+    mode_level_noise_ratio: float = 2.0
+    mode_level_delta_fraction: float = 0.35
+    state_min_confidence: float = 0.55
+    state_refractory_s: float = 0.08
+    uncertain_margin_s: float = 0.05
+    contact_anchor_window_s: float = 1.0
+    contact_lowess_window_s: float = 3.0
+    contact_robust_iterations: int = 2
+    bslow_tau_s: float = 60.0
+    bslow_update_rate: float = 1.0
+    bslow_stable_slope_threshold: float = 3e-4
+    bslow_stable_offset_threshold: float = 1e-3
+    pressure_slope_threshold: float = 3e-4
+    pressure_offset_threshold: float = 1e-3
+    j_smooth_window_s: float = 0.10
 
 
 def _as_signal(values: np.ndarray) -> np.ndarray:
@@ -116,6 +134,7 @@ def detect_multiscale_edges(
         raise ValueError("clean 与 Bcontext 必须等长")
 
     edge_signal = values - context
+    reference_level = max(float(np.median(np.abs(values))), np.finfo(float).eps)
     local_mad, reference_noise = _rolling_noise(edge_signal, fs)
     best_score = np.zeros(values.size)
     best_scale = np.zeros(values.size)
@@ -177,6 +196,7 @@ def detect_multiscale_edges(
                 "best_scale_s": smallest_scale,
                 "edge_score": float(first_score[center]),
                 "noise_scale": float(max(local_mad[center], reference_noise)),
+                "reference_level": reference_level,
             }
         )
 
@@ -240,6 +260,9 @@ def measure_edge_morphology(
     if final_post.size >= 2:
         right = float(np.median(final_post))
     delta = right - left
+    relative_amplitude = abs(float(delta)) / max(
+        float(candidate.get("reference_level", 1.0)), np.finfo(float).eps
+    )
 
     transition = values[start : end + 1]
     signed_steps = np.diff(transition) * (1.0 if delta >= 0 else -1.0)
@@ -268,6 +291,8 @@ def measure_edge_morphology(
         "level_right": right,
         "level_delta": float(delta),
         "level_snr": abs(float(delta)) / (1.4826 * morphology_noise),
+        "morphology_noise": morphology_noise,
+        "relative_amplitude": relative_amplitude,
         "direction": "up" if delta > 0 else "down",
         "monotonicity": monotonicity,
         "persistence": persistence,
@@ -292,18 +317,36 @@ def classify_edge_candidates(
         width = int(item["edge_width_points"])
         snr = float(item["level_snr"])
         persistence = float(item["persistence"])
+        relative_amplitude = float(item["relative_amplitude"])
+        positive_limit = config.mode_level_noise_ratio * float(item["morphology_noise"])
+        detach_destination = (
+            float(item["level_right"]) >= positive_limit
+            and float(item["level_right"]) >= config.mode_level_delta_fraction * abs(float(item["level_delta"]))
+        )
+        detach_origin = float(item["level_left"]) >= (
+            config.detach_pre_level_fraction * abs(float(item["level_delta"]))
+        )
+        attach_source = (
+            float(item["level_left"]) >= positive_limit
+            and float(item["level_left"]) >= config.mode_level_delta_fraction * abs(float(item["level_delta"]))
+        )
         if (
             direction == config.detach_direction
             and width <= config.detach_max_points
             and snr >= config.detach_min_snr
+            and relative_amplitude >= config.detach_min_relative_amplitude
             and persistence >= config.edge_min_persistence
+            and detach_destination
+            and detach_origin
         ):
             kind = "detach"
         elif (
             direction == config.attach_direction
             and width >= config.attach_min_points
             and snr >= config.attach_min_snr
+            and relative_amplitude >= config.attach_min_relative_amplitude
             and float(item["monotonicity"]) >= config.attach_min_monotonicity
+            and attach_source
         ):
             kind = "attach"
         elif width > config.detach_max_points:
@@ -327,3 +370,303 @@ def classify_edge_candidates(
         )
         classified.append(item)
     return classified
+
+
+def infer_contact_mode(
+    candidates: list[dict],
+    sample_count: int,
+    fs: float,
+    config: CascadeStateConfig,
+) -> dict:
+    """用独立边沿驱动 Contact/Non-contact 状态，而非等待完整事件对。
+
+    第一个可靠边沿同时确定记录开头的状态。detach 在 Contact 中立即生效；
+    attach 在 Non-contact 中生效，并在存在前序 detach 时检查恢复边沿确实更慢。
+    """
+    updated = [dict(item) for item in sorted(candidates, key=lambda x: x.get("center_index", 0))]
+    reliable = [
+        item for item in updated
+        if item.get("candidate_type") in {"detach", "attach"}
+        and float(item.get("confidence", 0.0)) >= config.state_min_confidence
+    ]
+    current_contact = not reliable or reliable[0]["candidate_type"] == "detach"
+    initial_contact = current_contact
+    accepted: list[dict] = []
+    last_detach: dict | None = None
+    last_event_end = -10**9
+    refractory = max(1, int(round(config.state_refractory_s * fs)))
+
+    for item in updated:
+        item["accepted"] = False
+        kind = item.get("candidate_type")
+        confidence = float(item.get("confidence", 0.0))
+        if kind not in {"detach", "attach"}:
+            item["rejection_reason"] = "pressure_or_ambiguous"
+            continue
+        if confidence < config.state_min_confidence:
+            item["rejection_reason"] = "low_confidence"
+            continue
+        if int(item["start_index"]) - last_event_end < refractory:
+            item["rejection_reason"] = "inside_refractory_period"
+            continue
+
+        if kind == "detach" and current_contact:
+            item["accepted"] = True
+            item["rejection_reason"] = None
+            item["event_type"] = "detach"
+            accepted.append(item)
+            current_contact = False
+            last_detach = item
+            last_event_end = int(item["end_index"])
+        elif kind == "attach" and not current_contact:
+            if last_detach is not None and int(item["edge_width_points"]) < int(
+                np.ceil(config.edge_asymmetry_ratio * int(last_detach["edge_width_points"]))
+            ):
+                item["rejection_reason"] = "attach_not_slower"
+                continue
+            item["accepted"] = True
+            item["rejection_reason"] = None
+            item["event_type"] = "attach"
+            accepted.append(item)
+            current_contact = True
+            last_detach = None
+            last_event_end = int(item["end_index"])
+        else:
+            item["rejection_reason"] = "edge_incompatible_with_current_state"
+
+    contact = np.zeros(sample_count, dtype=bool)
+    noncontact = np.zeros(sample_count, dtype=bool)
+    transition = np.zeros(sample_count, dtype=bool)
+    uncertain = np.zeros(sample_count, dtype=bool)
+    weight = np.zeros(sample_count, dtype=float)
+    confidence = np.ones(sample_count, dtype=float)
+    cursor = 0
+    current_contact = initial_contact
+
+    for event in accepted:
+        start = max(cursor, int(event["start_index"]))
+        end = min(sample_count - 1, int(event["end_index"]))
+        if current_contact:
+            contact[cursor:start] = True
+            weight[cursor:start] = 1.0
+        else:
+            noncontact[cursor:start] = True
+        transition[start : end + 1] = True
+        if event["event_type"] == "detach":
+            weight[start : end + 1] = np.linspace(1.0, 0.0, end - start + 1)
+            current_contact = False
+        else:
+            weight[start : end + 1] = np.linspace(0.0, 1.0, end - start + 1)
+            current_contact = True
+        confidence[start : end + 1] = float(event["confidence"])
+        cursor = end + 1
+
+    if current_contact:
+        contact[cursor:] = True
+        weight[cursor:] = 1.0
+    else:
+        noncontact[cursor:] = True
+
+    margin = max(0, int(round(config.uncertain_margin_s * fs)))
+    for item in updated:
+        if item["accepted"] or item.get("candidate_type") == "pressure_like":
+            continue
+        start = max(0, int(item.get("start_index", item.get("center_index", 0))) - margin)
+        end = min(sample_count, int(item.get("end_index", item.get("center_index", 0))) + margin + 1)
+        uncertain[start:end] = True
+        confidence[start:end] = 0.0
+
+    return {
+        "contact_mask": contact,
+        "noncontact_mask": noncontact,
+        "transition_mask": transition,
+        "uncertain_mask": uncertain,
+        "contact_weight": weight,
+        "state_confidence": confidence,
+        "J_events": accepted,
+        "edge_candidates": updated,
+    }
+
+
+def reconstruct_contact_signal(
+    clean: np.ndarray,
+    state: dict,
+    fs: float,
+    config: CascadeStateConfig,
+) -> dict:
+    """用最近的真实 Contact 锚点重建 Non-contact/Transition 区域。"""
+    values = _as_signal(clean)
+    active = np.asarray(state["noncontact_mask"]) | np.asarray(state["transition_mask"])
+    output = values.copy()
+    synthetic = np.zeros(values.size, dtype=bool)
+    indices = np.flatnonzero(active)
+    if indices.size == 0:
+        return {"Ucontact": output, "ucontact_synthetic_mask": synthetic}
+
+    groups = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
+    anchor = max(1, int(round(config.contact_anchor_window_s * fs)))
+    contact = np.asarray(state["contact_mask"], dtype=bool)
+    for group in groups:
+        start, end = int(group[0]), int(group[-1])
+        left_indices = np.flatnonzero(contact[max(0, start - anchor) : start]) + max(0, start - anchor)
+        right_indices = np.flatnonzero(contact[end + 1 : min(values.size, end + 1 + anchor)]) + end + 1
+        if left_indices.size and right_indices.size:
+            left = float(np.median(values[left_indices]))
+            right = float(np.median(values[right_indices]))
+            output[start : end + 1] = np.linspace(left, right, end - start + 1)
+        elif left_indices.size:
+            output[start : end + 1] = float(np.median(values[left_indices]))
+        elif right_indices.size:
+            output[start : end + 1] = float(np.median(values[right_indices]))
+        else:
+            continue
+        synthetic[start : end + 1] = True
+    return {"Ucontact": output, "ucontact_synthetic_mask": synthetic}
+
+
+def estimate_contact_trends(
+    ucontact: np.ndarray,
+    state: dict,
+    synthetic_mask: np.ndarray,
+    fs: float,
+    config: CascadeStateConfig,
+) -> dict:
+    """从接触模态信号估计 Bm，并仅在真实稳定 Contact 中更新 Bslow。"""
+    values = _as_signal(ucontact)
+    time = np.arange(values.size, dtype=float) / float(fs)
+    duration_s = values.size / float(fs)
+    fraction = min(
+        1.0,
+        max(3.0 / values.size, config.contact_lowess_window_s / duration_s),
+    )
+    bm = np.asarray(
+        lowess(
+            values,
+            time,
+            frac=fraction,
+            it=int(config.contact_robust_iterations),
+            return_sorted=False,
+        ),
+        dtype=float,
+    )
+    slope = np.gradient(bm) * float(fs)
+    real_contact = (
+        np.asarray(state["contact_mask"], dtype=bool)
+        & ~np.asarray(state["uncertain_mask"], dtype=bool)
+        & ~np.asarray(synthetic_mask, dtype=bool)
+    )
+    real_indices = np.flatnonzero(real_contact)
+    first = int(real_indices[0]) if real_indices.size else 0
+    bslow = np.full(values.size, bm[first], dtype=float)
+    update = np.zeros(values.size, dtype=bool)
+    alpha = config.bslow_update_rate * (
+        1.0 - np.exp(-1.0 / (float(fs) * config.bslow_tau_s))
+    )
+    for index in range(max(1, first + 1), values.size):
+        stable = (
+            real_contact[index]
+            and abs(slope[index]) < config.bslow_stable_slope_threshold
+            and abs(bm[index] - bslow[index - 1]) < config.bslow_stable_offset_threshold
+        )
+        if stable:
+            bslow[index] = bslow[index - 1] + alpha * (bm[index] - bslow[index - 1])
+            update[index] = True
+        else:
+            bslow[index] = bslow[index - 1]
+    return {
+        "Bm_contact": bm,
+        "dBm_dt": slope,
+        "Bslow": bslow,
+        "bslow_update_mask": update,
+    }
+
+
+def classify_contact_substates(
+    p: np.ndarray,
+    dBm_dt: np.ndarray,
+    state: dict,
+    config: CascadeStateConfig,
+) -> np.ndarray:
+    """仅在可靠 Contact 中按 P 与斜率定性标记压力阶段。"""
+    pressure = np.asarray(p)
+    slope = np.asarray(dBm_dt)
+    valid = np.asarray(state["contact_mask"]) & ~np.asarray(state["uncertain_mask"])
+    labels = np.full(pressure.size, "invalid_noncontact", dtype=object)
+    quiet = np.abs(slope) <= config.pressure_slope_threshold
+    near = np.abs(pressure) <= config.pressure_offset_threshold
+    labels[valid & quiet & near] = "baseline"
+    labels[valid & quiet & ~near] = "pressure_hold"
+    moving = valid & ~quiet
+    labels[moving & (pressure * slope >= 0.0)] = "loading"
+    labels[moving & (pressure * slope < 0.0)] = "relaxing"
+    return labels
+
+
+def decompose_cascade_udeco(
+    signal: np.ndarray,
+    fs: float,
+    config: CascadeStateConfig | None = None,
+) -> dict:
+    """执行形态边沿、接触状态和 Contact 内压力状态的完整级联分解。"""
+    config = CascadeStateConfig() if config is None else config
+    raw = _as_signal(signal).copy()
+    clean = median_clean(raw, config)
+    context = estimate_context_trend(clean, fs, config)
+    coarse, edge_diagnostics = detect_multiscale_edges(
+        clean, context["Bcontext"], fs, config
+    )
+    measured = [
+        measure_edge_morphology(
+            edge_diagnostics["edge_signal"],
+            candidate,
+            fs,
+            config,
+            edge_diagnostics["reference_noise"],
+        )
+        for candidate in coarse
+    ]
+    candidates = classify_edge_candidates(measured, config)
+    state = infer_contact_mode(candidates, raw.size, fs, config)
+    reconstruction = reconstruct_contact_signal(clean, state, fs, config)
+    trends = estimate_contact_trends(
+        reconstruction["Ucontact"],
+        state,
+        reconstruction["ucontact_synthetic_mask"],
+        fs,
+        config,
+    )
+
+    p_candidate = trends["Bm_contact"] - trends["Bslow"]
+    p = p_candidate * state["contact_weight"]
+    p[state["noncontact_mask"]] = 0.0
+    substates = classify_contact_substates(p, trends["dBm_dt"], state, config)
+
+    mode_active = state["noncontact_mask"] | state["transition_mask"]
+    mode_signal = clean - trends["Bslow"] - p
+    smooth_points = max(1, int(round(config.j_smooth_window_s * fs)) | 1)
+    smooth_mode = median_filter(mode_signal, size=smooth_points, mode="nearest")
+    j = np.zeros_like(clean)
+    j[mode_active] = smooth_mode[mode_active]
+    residual = clean - j - p - trends["Bslow"]
+
+    return {
+        "raw": raw,
+        "clean": clean,
+        **context,
+        "edge_score": edge_diagnostics["edge_score"],
+        "reference_noise": edge_diagnostics["reference_noise"],
+        "edge_candidates": state["edge_candidates"],
+        "J_events": state["J_events"],
+        "contact_mask": state["contact_mask"],
+        "noncontact_mask": state["noncontact_mask"],
+        "transition_mask": state["transition_mask"],
+        "uncertain_mask": state["uncertain_mask"],
+        "contact_weight": state["contact_weight"],
+        "state_confidence": state["state_confidence"],
+        **reconstruction,
+        **trends,
+        "P": p,
+        "contact_substate": substates,
+        "J": j,
+        "residual": residual,
+    }
