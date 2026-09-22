@@ -14,29 +14,34 @@ from statsmodels.nonparametric.smoothers_lowess import lowess
 class CascadeStateConfig:
     """集中保存秒制窗口和具有明确物理意义的形态阈值。"""
 
-    median_filter_points: int = 4
+    median_filter_points: int = 3
     context_window_s: float = 10.0
     context_robust_iterations: int = 1
     edge_scales_s: tuple[float, ...] = (
         0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56,
     )
-    edge_z_threshold: float = 4.0
+    edge_z_threshold: float = 3.0
+    edge_single_scale_z_threshold: float = 4.0
+    edge_min_scale_support: int = 2
     edge_merge_s: float = 0.08
     edge_level_window_min_s: float = 0.04
     edge_level_window_max_s: float = 0.20
     edge_guard_s: float = 0.02
+    edge_platform_tolerance_sigma: float = 1.0
+    edge_platform_tolerance_fraction: float = 0.03
+    edge_platform_stable_points: int = 2
     detach_direction: str = "up"
-    detach_max_points: int = 4
+    detach_max_points: int = 6
     detach_min_snr: float = 5.0
     detach_min_relative_amplitude: float = 0.03
     detach_pre_level_fraction: float = -0.20
     attach_direction: str = "down"
-    attach_min_points: int = 5
+    attach_min_points: int = 4
     attach_min_monotonicity: float = 0.65
     attach_min_snr: float = 4.0
     attach_min_relative_amplitude: float = 0.01
     edge_min_persistence: float = 0.60
-    edge_asymmetry_ratio: float = 2.0
+    edge_asymmetry_ratio: float = 1.5
     mode_level_noise_ratio: float = 2.0
     mode_level_delta_fraction: float = 0.35
     state_min_confidence: float = 0.55
@@ -137,9 +142,7 @@ def detect_multiscale_edges(
     reference_level = max(float(np.median(np.abs(values))), np.finfo(float).eps)
     local_mad, reference_noise = _rolling_noise(edge_signal, fs)
     best_score = np.zeros(values.size)
-    best_scale = np.zeros(values.size)
-    first_score = np.zeros(values.size)
-    first_scale = np.zeros(values.size)
+    scale_scores: list[tuple[float, np.ndarray]] = []
 
     # 每个中心比较左、右等长窗口的中位数，相当于对噪声更稳健的 Haar 核。
     for scale_s in config.edge_scales_s:
@@ -149,22 +152,22 @@ def detect_multiscale_edges(
         rolling_median = np.median(sliding_window_view(edge_signal, width), axis=1)
         centers = np.arange(width, values.size - width + 1)
         change = rolling_median[centers] - rolling_median[centers - width]
-        noise = np.maximum(local_mad[centers], reference_noise)
+        # 边沿中心的滚动 MAD 会把真实跃迁当噪声；候选阶段取两侧安静
+        # 平台的较小 MAD，仍由全段噪声下限防止分母接近零。
+        noise = np.maximum(
+            np.minimum(local_mad[centers - width], local_mad[centers + width - 1]),
+            reference_noise,
+        )
         score = change / np.maximum(1.4826 * noise, np.finfo(float).eps)
+        score_row = np.zeros(values.size)
+        score_row[centers] = score
+        scale_scores.append((scale_s, score_row))
 
         stronger = np.abs(score) > np.abs(best_score[centers])
         selected = centers[stronger]
         best_score[selected] = score[stronger]
-        best_scale[selected] = scale_s
 
-        first = (first_scale[centers] == 0.0) & (
-            np.abs(score) >= config.edge_z_threshold
-        )
-        selected = centers[first]
-        first_score[selected] = score[first]
-        first_scale[selected] = scale_s
-
-    active = np.flatnonzero(first_scale > 0.0)
+    active = np.flatnonzero(np.abs(best_score) >= config.edge_z_threshold)
     if active.size == 0:
         return [], {
             "edge_signal": edge_signal,
@@ -176,7 +179,7 @@ def detect_multiscale_edges(
     groups: list[list[int]] = [[int(active[0])]]
     for index in active[1:]:
         previous = groups[-1][-1]
-        same_direction = np.sign(first_score[index]) == np.sign(first_score[previous])
+        same_direction = np.sign(best_score[index]) == np.sign(best_score[previous])
         if index - previous <= merge_gap and same_direction:
             groups[-1].append(int(index))
         else:
@@ -185,17 +188,41 @@ def detect_multiscale_edges(
     candidates = []
     for group in groups:
         indices = np.asarray(group)
-        smallest_scale = float(np.min(first_scale[indices]))
-        fine = indices[first_scale[indices] == smallest_scale]
-        center = int(fine[np.argmax(np.abs(first_score[fine]))])
+        direction = np.sign(best_score[indices[0]])
+        supported = [
+            i for i, (_, row) in enumerate(scale_scores)
+            if np.any(direction * row[indices] >= config.edge_z_threshold)
+        ]
+        consecutive = longest_run = 1
+        for left, right in zip(supported, supported[1:]):
+            consecutive = consecutive + 1 if right - left == 1 else 1
+            longest_run = max(longest_run, consecutive)
+        has_neighboring_scales = longest_run >= max(2, config.edge_min_scale_support)
+        peak_score = max(
+            float(np.max(direction * scale_scores[i][1][indices])) for i in supported
+        )
+        if not (has_neighboring_scales or peak_score >= config.edge_single_scale_z_threshold):
+            continue
+
+        # 最细的有效尺度定位最快边沿；其它尺度只提供一致性证据。
+        smallest_index = supported[0]
+        smallest_scale, fine_score = scale_scores[smallest_index]
+        center = int(indices[np.argmax(direction * fine_score[indices])])
+        width = max(2, int(round(smallest_scale * fs)))
+        flank_noise = max(
+            float(min(local_mad[center - width], local_mad[center + width - 1])),
+            reference_noise,
+        )
         candidates.append(
             {
                 "center_index": center,
                 "coarse_start_index": int(indices[0]),
                 "coarse_end_index": int(indices[-1]),
                 "best_scale_s": smallest_scale,
-                "edge_score": float(first_score[center]),
-                "noise_scale": float(max(local_mad[center], reference_noise)),
+                "edge_score": float(direction * peak_score),
+                "scale_support": len(supported),
+                "support_scales_s": tuple(float(scale_scores[i][0]) for i in supported),
+                "noise_scale": flank_noise,
                 "reference_level": reference_level,
             }
         )
@@ -214,7 +241,7 @@ def measure_edge_morphology(
     config: CascadeStateConfig,
     reference_noise: float,
 ) -> dict:
-    """以固定短窗 L/R 和一次 10%–90% 穿越细化边沿形态。"""
+    """先用 10%–90% 粗定位，再以最终平台的容差带定位完整边沿。"""
     values = _as_signal(edge_signal)
     center = int(candidate["center_index"])
     scale_points = max(2, int(round(float(candidate["best_scale_s"]) * fs)))
@@ -249,17 +276,81 @@ def measure_edge_morphology(
     end = center + int(after[0]) if after.size else min(values.size - 1, center + 1)
     if end <= start:
         start, end = max(0, center - 1), min(values.size - 1, center + 1)
+    width_10_90 = end - start
 
-    # 最终 L/R 窗位于细化边沿之外；只更新平台量，不再循环移动边界。
-    final_pre_end = max(0, start - guard)
-    final_post_start = min(values.size, end + guard + 1)
-    final_pre = values[max(0, final_pre_end - level_points) : final_pre_end]
-    final_post = values[final_post_start : min(values.size, final_post_start + level_points)]
-    if final_pre.size >= 2:
+    # 重估 L/R 时避开整段 transition。平台和边界再相互校正一次，
+    # 避免先重算平台、却仍沿用旧 10%/90% start/end 的不自洽情况。
+    for _ in range(2):
+        final_pre_end = max(0, start - guard)
+        final_post_start = min(values.size, end + guard + 1)
+        final_pre = values[max(0, final_pre_end - level_points) : final_pre_end]
+        final_post = values[final_post_start : min(values.size, final_post_start + level_points)]
+        if final_pre.size < 2 or final_post.size < 2:
+            return {
+                **candidate, "candidate_type": "ambiguous",
+                "edge_width_10_90_points": width_10_90,
+                "rejection_reason": "no_stable_platform",
+            }
         left = float(np.median(final_pre))
-    if final_post.size >= 2:
         right = float(np.median(final_post))
-    delta = right - left
+        delta = right - left
+        if abs(delta) <= np.finfo(float).eps:
+            return {
+                **candidate, "candidate_type": "ambiguous",
+                "edge_width_10_90_points": width_10_90,
+                "rejection_reason": "no_level_change",
+            }
+
+        # 两侧 MAD 取较安静平台，避免正在运动的一侧再把真实边沿吞掉。
+        platform_mad = max(reference_noise, min(_mad(final_pre), _mad(final_post)))
+        platform_sigma = 1.4826 * platform_mad
+        tolerance = max(
+            config.edge_platform_tolerance_sigma * platform_sigma,
+            config.edge_platform_tolerance_fraction * abs(delta),
+        )
+        if 2 * tolerance >= abs(delta):
+            return {
+                **candidate, "candidate_type": "ambiguous",
+                "edge_width_10_90_points": width_10_90,
+                "rejection_reason": "platforms_not_separated",
+            }
+
+        progress = (values[search_start : search_end + 1] - left) / delta
+        band = tolerance / abs(delta)
+        stable_points = max(2, int(config.edge_platform_stable_points))
+        left_runs = np.convolve(
+            (np.abs(progress - 0.0) <= band).astype(int),
+            np.ones(stable_points, dtype=int), mode="valid",
+        )
+        departure_runs = np.convolve(
+            (progress > band).astype(int),
+            np.ones(stable_points, dtype=int), mode="valid",
+        )
+        right_runs = np.convolve(
+            (np.abs(progress - 1.0) <= band).astype(int),
+            np.ones(stable_points, dtype=int), mode="valid",
+        )
+        before = np.flatnonzero(left_runs[: max(0, center - search_start)] == stable_points)
+        if before.size:
+            after_left = int(before[-1]) + stable_points
+            departure = np.flatnonzero(departure_runs[after_left:] == stable_points)
+            if departure.size:
+                refined_start = search_start + after_left + int(departure[0])
+                arrival = np.flatnonzero(
+                    right_runs[refined_start - search_start + 1 :] == stable_points
+                )
+                if arrival.size:
+                    refined_end = refined_start + 1 + int(arrival[0])
+                    if refined_start == start and refined_end == end:
+                        break
+                    start, end = refined_start, refined_end
+                    continue
+        return {
+            **candidate, "candidate_type": "ambiguous",
+            "edge_width_10_90_points": width_10_90,
+            "rejection_reason": "no_stable_platform_boundary",
+        }
+
     relative_amplitude = abs(float(delta)) / max(
         float(candidate.get("reference_level", 1.0)), np.finfo(float).eps
     )
@@ -271,8 +362,8 @@ def measure_edge_morphology(
         float(candidate.get("noise_scale", reference_noise)),
         np.finfo(float).eps,
     )
-    tolerance = 1.4826 * morphology_noise
-    monotonicity = float(np.mean(signed_steps >= -tolerance)) if signed_steps.size else 1.0
+    step_tolerance = 1.4826 * morphology_noise
+    monotonicity = float(np.mean(signed_steps >= -step_tolerance)) if signed_steps.size else 1.0
     follow = values[end + 1 : min(values.size, end + 1 + level_points)]
     if follow.size:
         persistence = float(np.mean((follow - left) / delta >= 0.5))
@@ -287,6 +378,9 @@ def measure_edge_morphology(
         "end_s": end / float(fs),
         "edge_width_points": end - start,
         "edge_width_s": (end - start) / float(fs),
+        "edge_width_10_90_points": width_10_90,
+        "edge_width_10_90_s": width_10_90 / float(fs),
+        "platform_tolerance": tolerance,
         "level_left": left,
         "level_right": right,
         "level_delta": float(delta),
@@ -311,6 +405,7 @@ def classify_edge_candidates(
     for source in candidates:
         item = dict(source)
         if item.get("candidate_type") == "ambiguous":
+            item["classification_reasons"] = (item.get("rejection_reason", "ambiguous"),)
             classified.append(item)
             continue
         direction = item["direction"]
@@ -330,24 +425,32 @@ def classify_edge_candidates(
             float(item["level_left"]) >= positive_limit
             and float(item["level_left"]) >= config.mode_level_delta_fraction * abs(float(item["level_delta"]))
         )
-        if (
-            direction == config.detach_direction
-            and width <= config.detach_max_points
-            and snr >= config.detach_min_snr
-            and relative_amplitude >= config.detach_min_relative_amplitude
-            and persistence >= config.edge_min_persistence
-            and detach_destination
-            and detach_origin
-        ):
+        # 把每项物理门槛的失败原因单独保存；同一候选可以同时触发多项。
+        detach_checks = (
+            ("detach_width_too_long", width <= config.detach_max_points),
+            ("detach_low_snr", snr >= config.detach_min_snr),
+            ("detach_small_amplitude", relative_amplitude >= config.detach_min_relative_amplitude),
+            ("detach_short_persistence", persistence >= config.edge_min_persistence),
+            ("detach_destination_not_separated", detach_destination),
+            ("detach_origin_not_contact_like", detach_origin),
+        )
+        attach_checks = (
+            ("attach_width_too_short", width >= config.attach_min_points),
+            ("attach_low_snr", snr >= config.attach_min_snr),
+            ("attach_small_amplitude", relative_amplitude >= config.attach_min_relative_amplitude),
+            ("attach_low_monotonicity", float(item["monotonicity"]) >= config.attach_min_monotonicity),
+            ("attach_source_not_separated", attach_source),
+        )
+        if direction == config.detach_direction:
+            failures = tuple(reason for reason, passed in detach_checks if not passed)
+        elif direction == config.attach_direction:
+            failures = tuple(reason for reason, passed in attach_checks if not passed)
+        else:
+            failures = ("direction_not_supported",)
+
+        if direction == config.detach_direction and not failures:
             kind = "detach"
-        elif (
-            direction == config.attach_direction
-            and width >= config.attach_min_points
-            and snr >= config.attach_min_snr
-            and relative_amplitude >= config.attach_min_relative_amplitude
-            and float(item["monotonicity"]) >= config.attach_min_monotonicity
-            and attach_source
-        ):
+        elif direction == config.attach_direction and not failures:
             kind = "attach"
         elif width > config.detach_max_points:
             kind = "pressure_like"
@@ -366,6 +469,7 @@ def classify_edge_candidates(
         item.update(
             candidate_type=kind,
             confidence=float(confidence),
+            classification_reasons=failures,
             rejection_reason="awaiting_state_inference",
         )
         classified.append(item)

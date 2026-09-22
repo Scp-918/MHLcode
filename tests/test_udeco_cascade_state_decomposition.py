@@ -25,7 +25,7 @@ def _edge_pair_signal(fs: float = 100.0) -> tuple[np.ndarray, int, int]:
     return signal, detach, attach
 
 
-def test_four_point_median_removes_spike_but_keeps_persistent_step():
+def test_short_median_removes_spike_but_keeps_persistent_step():
     signal = np.r_[np.zeros(20), np.ones(20)]
     signal[8] = 9.0
 
@@ -33,6 +33,53 @@ def test_four_point_median_removes_spike_but_keeps_persistent_step():
 
     assert clean[8] == 0.0
     assert np.all(clean[24:] == 1.0)
+
+
+def test_default_cleaner_uses_three_points_for_a_fast_edge():
+    """奇数短窗去掉孤立尖峰，不给两点快速模态段引入偶数窗偏移。"""
+    signal = np.zeros(32)
+    signal[8] = 9.0
+    signal[16:18] = 1.0
+
+    clean = median_clean(signal, CascadeStateConfig())
+
+    assert CascadeStateConfig().median_filter_points == 3
+    assert clean[8] == 0.0
+    np.testing.assert_array_equal(clean[15:19], [0.0, 1.0, 1.0, 0.0])
+
+
+def test_haar_candidates_record_consistent_scale_support():
+    """真实阶跃的相邻尺度响应应共同支持候选，而非只留下单一最高分。"""
+    fs = 100.0
+    signal = np.full(800, 0.02)
+    signal[400:] += 0.01
+    config = CascadeStateConfig()
+    coarse, _ = detect_multiscale_edges(signal, np.zeros_like(signal), fs, config)
+    nearby = [item for item in coarse if abs(item["center_index"] - 400) <= 8]
+
+    assert nearby
+    assert nearby[0]["scale_support"] >= 2
+    assert len(nearby[0]["support_scales_s"]) == nearby[0]["scale_support"]
+
+
+def test_morphology_uses_final_platforms_for_full_edge_boundaries():
+    """start/end 对应离开 L、稳定进入 R，而不是 10%/90% 穿越点。"""
+    signal = np.r_[np.zeros(100), np.linspace(0.0, 0.01, 6), np.full(100, 0.01)]
+    candidate = {
+        "center_index": 103,
+        "best_scale_s": 0.04,
+        "edge_score": 8.0,
+        "noise_scale": 1e-5,
+        "reference_level": 0.02,
+    }
+
+    edge = measure_edge_morphology(signal, candidate, 100.0, CascadeStateConfig(), 1e-5)
+
+    assert edge["start_index"] == 101
+    assert edge["end_index"] == 105
+    assert edge["edge_width_points"] == edge["end_index"] - edge["start_index"]
+    assert edge["edge_width_10_90_points"] >= edge["edge_width_points"]
+    assert np.isclose(edge["platform_tolerance"], 0.0003)
 
 
 def test_morphology_classifies_fast_up_and_slower_down_edges():
@@ -66,6 +113,31 @@ def test_morphology_classifies_fast_up_and_slower_down_edges():
 
     assert detach and detach[0]["edge_width_points"] <= 4
     assert attach and attach[0]["edge_width_points"] >= 5
+
+
+def test_classification_records_each_failed_morphology_gate():
+    """多个形态门槛同时不满足时，诊断信息不能只剩笼统的类别。"""
+    base = {
+        "level_snr": 2.0,
+        "relative_amplitude": 0.02,
+        "persistence": 0.4,
+        "monotonicity": 0.8,
+        "morphology_noise": 0.001,
+        "level_left": 0.0,
+        "level_right": 0.01,
+        "level_delta": 0.01,
+        "edge_score": 5.0,
+    }
+    slow_up = {**base, "direction": "up", "edge_width_points": 7}
+    classified = classify_edge_candidates([slow_up], CascadeStateConfig())
+
+    assert classified[0]["candidate_type"] == "pressure_like"
+    assert classified[0]["classification_reasons"] == (
+        "detach_width_too_long",
+        "detach_low_snr",
+        "detach_small_amplitude",
+        "detach_short_persistence",
+    )
 
 
 def _state_edge(center: int, start: int, end: int, kind: str) -> dict:
