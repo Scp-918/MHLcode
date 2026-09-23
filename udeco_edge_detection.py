@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.ndimage import median_filter
+from scipy.stats import rankdata
 from statsmodels.nonparametric.smoothers_lowess import lowess
 
 
@@ -20,16 +21,20 @@ class CascadeStateConfig:
     edge_scales_s: tuple[float, ...] = (
         0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56,
     )
-    edge_z_threshold: float = 3.0
-    edge_single_scale_z_threshold: float = 4.0
-    edge_derivative_z_threshold: float = 4.0
+    edge_z_threshold: float = 2.5
+    edge_single_scale_z_threshold: float = 3.5
+    edge_derivative_z_threshold: float = 3.5
     edge_min_scale_support: int = 2
     edge_merge_s: float = 0.08
+    edge_fragment_merge_s: float = 0.02
+    edge_fragment_min_spearman: float = 0.50
+    edge_fragment_min_forward_fraction: float = 0.60
     edge_fit_min_window_s: float = 0.25
     edge_fit_max_window_s: float = 1.50
     edge_min_snr: float = 3.0
     edge_min_fit_improvement: float = 0.15
     edge_min_plateau_contrast: float = 0.50
+    amplitude_cluster_min_separation: float = 2.50
     uncertain_margin_s: float = 0.05
     contact_anchor_window_s: float = 1.0
     contact_lowess_window_s: float = 3.0
@@ -174,9 +179,10 @@ def detect_multiscale_edges(
             consecutive = consecutive + 1 if right - left == 1 else 1
             longest_run = max(longest_run, consecutive)
         has_neighboring_scales = longest_run >= max(2, config.edge_min_scale_support)
-        peak_score = max(
+        supported_peaks = [
             float(np.max(direction * scale_scores[i][1][indices])) for i in supported
-        )
+        ]
+        peak_score = max(supported_peaks)
         if not (has_neighboring_scales or peak_score >= config.edge_single_scale_z_threshold):
             continue
 
@@ -184,6 +190,8 @@ def detect_multiscale_edges(
         smallest_index = supported[0]
         smallest_scale, fine_score = scale_scores[smallest_index]
         center = int(indices[np.argmax(direction * fine_score[indices])])
+        main_index = supported[int(np.argmax(supported_peaks))]
+        morphology_scale = float(scale_scores[main_index][0])
         width = max(2, int(round(smallest_scale * fs)))
         flank_noise = max(
             float(min(local_mad[center - width], local_mad[center + width - 1])),
@@ -195,6 +203,9 @@ def detect_multiscale_edges(
                 "coarse_start_index": int(indices[0]),
                 "coarse_end_index": int(indices[-1]),
                 "best_scale_s": smallest_scale,
+                "localization_scale": float(smallest_scale),
+                "morphology_scale": morphology_scale,
+                "localization_score": float(direction * fine_score[center]),
                 "edge_score": float(direction * peak_score),
                 "scale_support": len(supported),
                 "support_scales_s": tuple(float(scale_scores[i][0]) for i in supported),
@@ -243,6 +254,9 @@ def detect_multiscale_edges(
         if matching:
             item = min(matching, key=lambda row: abs(int(row["center_index"]) - center))
             item["center_index"] = center
+            item["best_scale_s"] = min(float(item["best_scale_s"]), 1.0 / float(fs))
+            item["localization_scale"] = float(item["best_scale_s"])
+            item["localization_score"] = float(derivative_score[center])
             item["detection_channels"] = ("haar", "derivative")
             item["derivative_score"] = float(derivative_score[center])
             item["coarse_start_index"] = min(item["coarse_start_index"], int(indices[0]))
@@ -253,6 +267,9 @@ def detect_multiscale_edges(
                 "coarse_start_index": int(indices[0]),
                 "coarse_end_index": int(indices[-1]),
                 "best_scale_s": 1.0 / float(fs),
+                "localization_scale": 1.0 / float(fs),
+                "morphology_scale": 1.0 / float(fs),
+                "localization_score": float(derivative_score[center]),
                 "edge_score": float(derivative_score[center]),
                 "derivative_score": float(derivative_score[center]),
                 "scale_support": 0,
@@ -268,6 +285,113 @@ def detect_multiscale_edges(
         "derivative_score": derivative_score,
         "reference_noise": reference_noise,
     }
+
+
+def _as_fragment(candidate: dict) -> dict:
+    """为 primitive candidate 补上 fragment 诊断字段。"""
+    item = dict(candidate)
+    center = int(item["center_index"])
+    localization_scale = float(item.get("localization_scale", item["best_scale_s"]))
+    item.update(
+        best_scale_s=localization_scale,
+        localization_scale=localization_scale,
+        morphology_scale=float(item.get("morphology_scale", localization_scale)),
+        primitive_count=1,
+        fragment_centers=(center,),
+        merged_start_index=center,
+        merged_end_index=center,
+        fragment_merge_spearman=(),
+        fragment_merge_forward_fraction=(),
+    )
+    return item
+
+
+def _merge_fragment_pair(left: dict, right: dict, rho: float, forward_fraction: float) -> dict:
+    """合并两个已确认属于同一物理边沿的相邻 fragment。"""
+    merged = dict(left)
+    if abs(float(right.get("localization_score", right["edge_score"]))) > abs(
+        float(left.get("localization_score", left["edge_score"]))
+    ):
+        merged["center_index"] = int(right["center_index"])
+        merged["localization_scale"] = float(right["localization_scale"])
+        merged["best_scale_s"] = float(right["localization_scale"])
+        merged["localization_score"] = float(
+            right.get("localization_score", right["edge_score"])
+        )
+    if abs(float(right["edge_score"])) > abs(float(merged["edge_score"])):
+        merged["edge_score"] = float(right["edge_score"])
+    if "derivative_score" in right and (
+        "derivative_score" not in merged
+        or abs(float(right["derivative_score"])) > abs(float(merged["derivative_score"]))
+    ):
+        merged["derivative_score"] = float(right["derivative_score"])
+
+    scales = tuple(sorted(set(merged.get("support_scales_s", ())) | set(right.get("support_scales_s", ()))))
+    channels = tuple(dict.fromkeys((*merged.get("detection_channels", ()), *right.get("detection_channels", ()))))
+    centers = (*merged["fragment_centers"], *right["fragment_centers"])
+    merged.update(
+        coarse_start_index=min(int(merged["coarse_start_index"]), int(right["coarse_start_index"])),
+        coarse_end_index=max(int(merged["coarse_end_index"]), int(right["coarse_end_index"])),
+        morphology_scale=max(float(merged["morphology_scale"]), float(right["morphology_scale"])),
+        scale_support=len(scales),
+        support_scales_s=scales,
+        noise_scale=min(float(merged["noise_scale"]), float(right["noise_scale"])),
+        detection_channels=channels,
+        primitive_count=int(merged["primitive_count"]) + int(right["primitive_count"]),
+        fragment_centers=tuple(int(center) for center in centers),
+        merged_start_index=int(centers[0]),
+        merged_end_index=int(centers[-1]),
+        fragment_merge_spearman=(*merged["fragment_merge_spearman"], float(rho)),
+        fragment_merge_forward_fraction=(
+            *merged["fragment_merge_forward_fraction"], float(forward_fraction)
+        ),
+    )
+    return merged
+
+
+def merge_candidate_fragments(
+    clean: np.ndarray,
+    candidates: list[dict],
+    fs: float,
+    config: CascadeStateConfig,
+) -> list[dict]:
+    """递归合并短间隔、同方向且由 clean 支持连续变化的 candidate。"""
+    values = _as_signal(clean)
+    primitives = [_as_fragment(item) for item in sorted(candidates, key=lambda row: row["center_index"])]
+    if not primitives:
+        return []
+
+    maximum_gap = max(1, int(round(config.edge_fragment_merge_s * fs)))
+    merged = [primitives[0]]
+    for right in primitives[1:]:
+        left = merged[-1]
+        direction = float(np.sign(left["edge_score"]))
+        same_direction = direction == float(np.sign(right["edge_score"]))
+        left_center = int(left["fragment_centers"][-1])
+        right_center = int(right["fragment_centers"][0])
+        gap = right_center - left_center
+        if not same_direction or gap > maximum_gap:
+            merged.append(right)
+            continue
+        if gap == 0:
+            merged[-1] = _merge_fragment_pair(left, right, 1.0, 1.0)
+            continue
+
+        bridge = values[left_center : right_center + 1]
+        signed_steps = direction * np.diff(bridge)
+        signed_net = direction * float(bridge[-1] - bridge[0])
+        ranks = rankdata(bridge)
+        rho = float(np.corrcoef(np.arange(bridge.size, dtype=float), ranks)[0, 1])
+        forward_fraction = float(np.mean(signed_steps > 0.0))
+        if (
+            signed_net > 0.0
+            and direction * rho >= config.edge_fragment_min_spearman
+            and forward_fraction >= config.edge_fragment_min_forward_fraction
+        ):
+            merged[-1] = _merge_fragment_pair(left, right, rho, forward_fraction)
+        else:
+            merged.append(right)
+    return merged
 
 
 def _robust_linear_fit(design: np.ndarray, values: np.ndarray, noise: float) -> tuple[np.ndarray, np.ndarray, float]:
@@ -303,12 +427,15 @@ def measure_edge_morphology(
     center = int(candidate["center_index"])
     if not 0 <= center < values.size:
         raise ValueError("candidate center_index 超出信号范围")
-    scale_s = float(candidate["best_scale_s"])
+    scale_s = float(candidate.get("morphology_scale", candidate["best_scale_s"]))
     radius_s = min(config.edge_fit_max_window_s, max(config.edge_fit_min_window_s, 3.0 * scale_s))
     radius = max(3, int(round(radius_s * fs)))
+    merged_start = int(candidate.get("merged_start_index", center))
+    merged_end = int(candidate.get("merged_end_index", center))
+    scale_padding = max(2, int(round(scale_s * fs)))
     lower, upper = (0, values.size - 1) if window_bounds is None else window_bounds
-    lo = max(0, center - radius, int(lower))
-    hi = min(values.size - 1, center + radius, int(upper))
+    lo = max(0, min(center - radius, merged_start - scale_padding), int(lower))
+    hi = min(values.size - 1, max(center + radius, merged_end + scale_padding), int(upper))
     if hi - lo < 4 or center <= lo or center >= hi:
         return {
             **candidate, "candidate_type": "ambiguous", "confidence": 0.0,
@@ -441,6 +568,80 @@ def classify_edge_candidates(
         )
         classified.append(item)
     return classified
+
+
+def filter_edge_amplitudes(
+    candidates: list[dict],
+    config: CascadeStateConfig,
+) -> tuple[list[dict], dict]:
+    """对局部形态合格事件的 log-amplitude 做 recording 级一维 K=2。"""
+    filtered = [dict(item) for item in candidates]
+    eligible = [
+        index for index, item in enumerate(filtered)
+        if item.get("candidate_type") in {"detach", "attach"}
+    ]
+    diagnostics = {
+        "amplitude_clusters_separated": False,
+        "amplitude_cluster_separation": 0.0,
+        "amplitude_cluster_centers": (),
+        "pre_amplitude_event_count": len(eligible),
+        "post_amplitude_event_count": len(eligible),
+    }
+    if len(eligible) < 4:
+        for index in eligible:
+            filtered[index]["amplitude_cluster"] = "unseparated"
+        return filtered, diagnostics
+
+    amplitudes = np.asarray([abs(float(filtered[index]["delta"])) for index in eligible])
+    logged = np.log(amplitudes + np.finfo(float).eps)
+    centers = np.quantile(logged, [0.25, 0.75])
+    labels = np.zeros(logged.size, dtype=int)
+    for _ in range(30):
+        labels = np.argmin(np.abs(logged[:, None] - centers[None, :]), axis=1)
+        if any(np.count_nonzero(labels == group) == 0 for group in (0, 1)):
+            break
+        updated = np.asarray([np.mean(logged[labels == group]) for group in (0, 1)])
+        if np.allclose(updated, centers):
+            centers = updated
+            break
+        centers = updated
+
+    counts = np.bincount(labels, minlength=2)
+    if np.any(counts < 2):
+        for index in eligible:
+            filtered[index]["amplitude_cluster"] = "unseparated"
+        return filtered, diagnostics
+
+    spreads = np.asarray([np.std(logged[labels == group]) for group in (0, 1)])
+    pooled = float(np.sqrt(np.mean(spreads**2)))
+    separation = abs(float(centers[1] - centers[0])) / max(pooled, np.finfo(float).eps)
+    small_group = int(np.argmin(centers))
+    separated = separation >= config.amplitude_cluster_min_separation
+    diagnostics.update(
+        amplitude_clusters_separated=bool(separated),
+        amplitude_cluster_separation=float(separation),
+        amplitude_cluster_centers=tuple(float(np.exp(center)) for center in centers),
+    )
+
+    for position, index in enumerate(eligible):
+        item = filtered[index]
+        item["pre_amplitude_candidate_type"] = item["candidate_type"]
+        if not separated:
+            item["amplitude_cluster"] = "unseparated"
+        elif int(labels[position]) == small_group:
+            item["amplitude_cluster"] = "small"
+            item["candidate_type"] = "ambiguous"
+            item["classification_reasons"] = (
+                *item.get("classification_reasons", ()), "small_amplitude_cluster",
+            )
+            item["rejection_reason"] = "small_amplitude_cluster"
+        else:
+            item["amplitude_cluster"] = "large"
+
+    diagnostics["post_amplitude_event_count"] = sum(
+        item.get("candidate_type") in {"detach", "attach"} for item in filtered
+    )
+    return filtered, diagnostics
 
 
 def infer_contact_mode(
@@ -641,21 +842,26 @@ def decompose_cascade_udeco(
     raw = _as_signal(signal).copy()
     clean = median_clean(raw, config)
     context = estimate_context_trend(clean, fs, config)
-    coarse, edge_diagnostics = detect_multiscale_edges(
+    primitive, edge_diagnostics = detect_multiscale_edges(
         clean, context["Bcontext"], fs, config
     )
+    merged = merge_candidate_fragments(clean, primitive, fs, config)
     measured = []
-    for index, candidate in enumerate(coarse):
-        center = int(candidate["center_index"])
-        lower = 0 if index == 0 else (int(coarse[index - 1]["center_index"]) + center) // 2 + 1
-        upper = raw.size - 1 if index + 1 == len(coarse) else (
-            center + int(coarse[index + 1]["center_index"])
+    for index, candidate in enumerate(merged):
+        current_start = int(candidate["merged_start_index"])
+        current_end = int(candidate["merged_end_index"])
+        lower = 0 if index == 0 else (
+            int(merged[index - 1]["merged_end_index"]) + current_start
+        ) // 2 + 1
+        upper = raw.size - 1 if index + 1 == len(merged) else (
+            current_end + int(merged[index + 1]["merged_start_index"])
         ) // 2
         measured.append(measure_edge_morphology(
             clean, candidate, fs, config, edge_diagnostics["reference_noise"],
             (lower, upper),
         ))
-    candidates = classify_edge_candidates(measured, config)
+    locally_classified = classify_edge_candidates(measured, config)
+    candidates, amplitude_diagnostics = filter_edge_amplitudes(locally_classified, config)
     state = infer_contact_mode(candidates, raw.size, fs, config)
     reconstruction = reconstruct_contact_signal(clean, state, fs, config)
     trends = estimate_contact_trends(
@@ -686,6 +892,10 @@ def decompose_cascade_udeco(
         "edge_score": edge_diagnostics["edge_score"],
         "derivative_score": edge_diagnostics["derivative_score"],
         "reference_noise": edge_diagnostics["reference_noise"],
+        "primitive_count": len(primitive),
+        "merged_count": len(merged),
+        "morphology_event_count": amplitude_diagnostics["pre_amplitude_event_count"],
+        **amplitude_diagnostics,
         "edge_candidates": state["edge_candidates"],
         "J_events": state["J_events"],
         "contact_mask": state["contact_mask"],

@@ -11,6 +11,8 @@ from udeco_edge_detection import (
     infer_contact_mode,
     measure_edge_morphology,
     median_clean,
+    merge_candidate_fragments,
+    filter_edge_amplitudes,
 )
 
 
@@ -191,3 +193,108 @@ def test_gradual_pressure_without_local_plateau_step_stays_contact():
         result["clean"],
         result["J"] + result["P"] + result["Bslow"] + result["residual"],
     )
+
+
+def _primitive(center, direction=1.0, morphology_scale=0.04):
+    return {
+        "center_index": center,
+        "coarse_start_index": center,
+        "coarse_end_index": center,
+        "best_scale_s": 0.02,
+        "localization_scale": 0.02,
+        "morphology_scale": morphology_scale,
+        "edge_score": direction * 6.0,
+        "scale_support": 2,
+        "support_scales_s": (0.02, 0.04),
+        "noise_scale": 1e-4,
+        "detection_channels": ("haar",),
+    }
+
+
+def test_three_fragments_of_one_ramp_merge_recursively():
+    clean = np.full(140, 0.02)
+    clean[50:57] += np.linspace(0.0, 0.012, 7)
+    clean[57:] += 0.012
+    primitives = [_primitive(51), _primitive(53), _primitive(55, morphology_scale=0.08)]
+
+    merged = merge_candidate_fragments(
+        clean, primitives, 100.0, CascadeStateConfig()
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["primitive_count"] == 3
+    assert merged[0]["fragment_centers"] == (51, 53, 55)
+    assert merged[0]["merged_start_index"] == 51
+    assert merged[0]["merged_end_index"] == 55
+    assert merged[0]["localization_scale"] == 0.02
+    assert merged[0]["morphology_scale"] == 0.08
+
+
+def test_separate_steps_outside_fragment_gap_are_not_merged():
+    clean = np.full(140, 0.02)
+    clean[50:] += 0.006
+    clean[54:] += 0.006
+
+    merged = merge_candidate_fragments(
+        clean, [_primitive(50), _primitive(54)], 100.0, CascadeStateConfig()
+    )
+
+    assert len(merged) == 2
+    assert [item["primitive_count"] for item in merged] == [1, 1]
+
+
+def test_merged_span_and_morphology_scale_cover_complete_long_ramp():
+    signal = _ramp_signal(70, 120, -0.01)
+    candidate = {
+        **_primitive(94, direction=-1.0, morphology_scale=0.32),
+        "primitive_count": 3,
+        "fragment_centers": (76, 94, 114),
+        "merged_start_index": 76,
+        "merged_end_index": 114,
+    }
+
+    fitted = measure_edge_morphology(
+        signal, candidate, 100.0, CascadeStateConfig(), 1e-5, (0, 180)
+    )
+
+    assert abs(fitted["start_index"] - 70) <= 2
+    assert abs(fitted["end_index"] - 120) <= 2
+    assert fitted["fit_window_start_index"] < 70
+    assert fitted["fit_window_end_index"] > 120
+
+
+def _classified_amplitude(delta):
+    return {
+        "candidate_type": "detach" if delta > 0 else "attach",
+        "delta": delta,
+        "classification_reasons": (),
+        "confidence": 0.9,
+    }
+
+
+def test_clear_amplitude_clusters_downgrade_small_cluster():
+    candidates = [
+        *[_classified_amplitude(value) for value in (0.00018, 0.00020, 0.00022)],
+        *[_classified_amplitude(value) for value in (0.0048, 0.0050, 0.0052)],
+    ]
+
+    filtered, diagnostics = filter_edge_amplitudes(candidates, CascadeStateConfig())
+
+    assert diagnostics["amplitude_clusters_separated"]
+    assert [item["candidate_type"] for item in filtered[:3]] == ["ambiguous"] * 3
+    assert [item["amplitude_cluster"] for item in filtered] == ["small"] * 3 + ["large"] * 3
+    assert all(item["pre_amplitude_candidate_type"] == "detach" for item in filtered)
+
+
+def test_overlapping_amplitudes_do_not_filter_events():
+    candidates = [
+        _classified_amplitude(value)
+        for value in (0.0010, 0.0011, 0.0012, 0.0013, 0.0014, 0.0015)
+    ]
+
+    config = CascadeStateConfig(amplitude_cluster_min_separation=10.0)
+    filtered, diagnostics = filter_edge_amplitudes(candidates, config)
+
+    assert not diagnostics["amplitude_clusters_separated"]
+    assert all(item["candidate_type"] == "detach" for item in filtered)
+    assert all(item["amplitude_cluster"] == "unseparated" for item in filtered)
