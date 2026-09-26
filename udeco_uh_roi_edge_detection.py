@@ -103,18 +103,22 @@ def baseline_sigmas(uh_edge_signal: np.ndarray, udeco_edge_signal: np.ndarray,
 
 
 def _refined_boundary(values: np.ndarray, start: int, stop: int, step: int,
-                      sign: int, flat_slope: float, flat_points: int) -> int:
+                      sign: int, flat_slope: float, flat_points: int,
+                      near_base_limit: float) -> int:
     """Walk away from a peak until a valley/crest or sustained flat slope."""
     signed = sign * values
+    base_level = signed[stop]
     index = start
     while index != stop:
         nxt = index + step
         if nxt < 0 or nxt >= len(values):
             break
-        if 0 < nxt < len(values) - 1 and signed[nxt] <= min(signed[nxt-1], signed[nxt+1]):
+        near_base = signed[nxt] <= base_level + near_base_limit
+        if (near_base and 0 < nxt < len(values) - 1
+                and signed[nxt] <= min(signed[nxt-1], signed[nxt+1])):
             return nxt
         edge = min(index, nxt)
-        if abs(values[nxt] - values[index]) <= flat_slope:
+        if near_base and abs(values[nxt] - values[index]) <= flat_slope:
             lo = max(0, edge - flat_points + 1) if step < 0 else edge
             hi = edge + flat_points if step > 0 else edge + 1
             if hi <= len(values) - 1 and hi - lo >= flat_points and np.all(np.abs(np.diff(values[lo:hi+1])) <= flat_slope):
@@ -155,10 +159,12 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
             right_limit = min(right_limit, (peak["peak_idx"] + peaks[position+1]["peak_idx"]) // 2)
         peak["refined_left_idx"] = _refined_boundary(
             values, peak["plateau_left_idx"], left_limit, -1, peak["sign"],
-            config.uh_flat_slope_sigma * sigma_duh, flat_points)
+            config.uh_flat_slope_sigma * sigma_duh, flat_points,
+            config.uh_peak_prominence_sigma * sigma_uh)
         peak["refined_right_idx"] = _refined_boundary(
             values, peak["plateau_right_idx"], right_limit, 1, peak["sign"],
-            config.uh_flat_slope_sigma * sigma_duh, flat_points)
+            config.uh_flat_slope_sigma * sigma_duh, flat_points,
+            config.uh_peak_prominence_sigma * sigma_uh)
         peak["roi_left_idx"] = max(0, peak["refined_left_idx"] - margin)
         peak["roi_right_idx"] = min(len(values) - 1, peak["refined_right_idx"] + margin)
     rois = []
@@ -338,19 +344,29 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
     edge_signal = np.asarray(edge_signal, dtype=float)
     derivative = np.diff(edge_signal)
     roi_by_id = {roi["roi_id"]: roi for roi in rois}
+    neighbor_bounds = {}
+    for roi_id in roi_by_id:
+        ordered = sorted((i for i, row in enumerate(candidates) if row["roi_id"] == roi_id),
+                         key=lambda i: candidates[i]["center_idx"])
+        for position, i in enumerate(ordered):
+            center = int(candidates[i]["center_idx"])
+            left = (int(candidates[ordered[position-1]]["center_idx"]) + center) // 2 if position else roi_by_id[roi_id]["left_idx"]
+            right = (center + int(candidates[ordered[position+1]]["center_idx"])) // 2 if position + 1 < len(ordered) else roi_by_id[roi_id]["right_idx"]
+            neighbor_bounds[i] = (left, right)
     radius = max(1, round(config.localize_search_sec * fs))
     pre_points = max(1, round(config.pre_plateau_sec * fs))
     post_points = max(1, round(config.post_plateau_sec * fs))
     settle_points = max(1, round(config.settle_window_sec * fs))
     hold_points = max(1, round(config.settle_hold_sec * fs))
     result = []
-    for candidate in candidates:
+    for candidate_index, candidate in enumerate(candidates):
         roi = roi_by_id[candidate["roi_id"]]
         left, right = int(roi["left_idx"]), int(roi["right_idx"])
+        search_left, search_right = neighbor_bounds[candidate_index]
         center = int(candidate["center_idx"])
         direction = int(candidate["direction"])
-        lo = max(left, center - radius - 1)
-        hi = min(right - 1, center + radius)
+        lo = max(search_left, center - radius - 1)
+        hi = min(search_right - 1, center + radius)
         if hi < lo:
             result.append(_unresolved(candidate, "no_derivative_window"))
             continue

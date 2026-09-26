@@ -154,3 +154,34 @@ def test_roi_selects_only_largest_actual_rise_and_fall():
     assert table.loc[table.is_main_rising, "center_idx"].tolist() == [110]
     assert table.loc[table.is_main_falling, "center_idx"].tolist() == [120]
     assert table.loc[table.center_idx == 100, "is_main_rising"].item() == False
+
+
+def test_slow_uh_peak_roi_contains_both_true_event_boundaries():
+    uh = np.zeros(300)
+    uh[100:151] = np.linspace(0, 5, 51)
+    uh[151:202] = np.linspace(4.9, 0, 51)
+    rois, _ = find_uh_rois(uh, fs=100, sigma_uh=0.1, sigma_duh=0.1,
+                           config=ExperimentConfig())
+    assert len(rois) == 1
+    assert rois[0]["left_idx"] <= 100
+    assert rois[0]["right_idx"] >= 201
+
+
+def test_nearby_candidate_centers_localize_distinct_steps():
+    signal = np.zeros(2200)
+    signal[1800:] += 0.01
+    signal[1810:] += 0.02
+    roi = {"roi_id": "ROI_0", "left_idx": 1750, "right_idx": 1880}
+    candidates = [{"roi_id": "ROI_0", "center_idx": center, "direction": 1,
+                   "region_start_idx": center, "region_end_idx": center,
+                   "detector_score": 20.0, "detector_name": "median_diff"}
+                  for center in (1800, 1810)]
+    measured = localize_roi_candidates(
+        signal, signal, candidates, [roi], fs=100,
+        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=ExperimentConfig())
+    assert measured[0]["derivative_peak_idx"] == 1800
+    assert measured[0]["resolved"]
+    assert np.isclose(measured[0]["delta"], 0.01)
+    assert measured[1]["resolved"]
+    assert measured[1]["derivative_peak_idx"] == 1810
+    assert np.isclose(measured[1]["delta"], 0.02)
