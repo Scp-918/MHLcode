@@ -7,6 +7,7 @@ import numpy as np
 from udeco_uh_roi_edge_detection import (
     ExperimentConfig,
     baseline_sigmas,
+    detect_roi_candidates,
     find_uh_rois,
     load_paired_sample,
 )
@@ -51,3 +52,38 @@ def test_overlapping_peak_rois_merge_and_keep_source_peaks():
     assert len(rois[0]["peak_indices"]) == 2
     assert rois[0]["left_idx"] <= 100
     assert rois[0]["right_idx"] >= 151
+
+
+def test_median_difference_detects_one_sample_steps_only_inside_roi():
+    rng = np.random.default_rng(12)
+    signal = rng.normal(0, 1e-4, 2500)
+    signal[1800:1900] += 0.01
+    signal[2200:] += 0.02  # Must not be detected outside the Uh ROI.
+    roi = {"roi_id": "ROI_0", "left_idx": 1750, "right_idx": 1950}
+    candidates, diagnostics = detect_roi_candidates(
+        signal, [roi], fs=100, config=ExperimentConfig())
+    assert any(c["direction"] == 1 and abs(c["center_idx"] - 1800) <= 1 for c in candidates)
+    assert any(c["direction"] == -1 and abs(c["center_idx"] - 1900) <= 1 for c in candidates)
+    assert all(1750 <= c["center_idx"] <= 1950 for c in candidates)
+    assert all(c["detector_name"] == "median_diff" for c in candidates)
+    assert set(("roi_id", "center_idx", "region_start_idx", "region_end_idx",
+                "direction", "detector_score", "detector_name")) <= candidates[0].keys()
+    assert 1 in diagnostics["scale_scores"]
+
+
+def test_haar_switch_uses_same_candidate_contract_and_fixed_baseline_noise():
+    rng = np.random.default_rng(13)
+    signal = rng.normal(0, 1e-4, 2500)
+    signal[1800:1900] += 0.01
+    roi = {"roi_id": "ROI_0", "left_idx": 1750, "right_idx": 1950}
+    cfg = ExperimentConfig(edge_detector="haar")
+    candidates, diagnostics = detect_roi_candidates(signal, [roi], fs=100, config=cfg)
+    assert any(c["direction"] == 1 and abs(c["center_idx"] - 1800) <= 5 for c in candidates)
+    assert any(c["direction"] == -1 and abs(c["center_idx"] - 1900) <= 5 for c in candidates)
+    assert all(c["detector_name"] == "haar" for c in candidates)
+    assert all(c["roi_id"] == "ROI_0" for c in candidates)
+    assert diagnostics["scale_sigmas"]
+    altered = signal.copy()
+    altered[2050:] += rng.normal(0, 0.1, len(altered[2050:]))
+    _, altered_diagnostics = detect_roi_candidates(altered, [roi], fs=100, config=cfg)
+    assert diagnostics["scale_sigmas"] == altered_diagnostics["scale_sigmas"]

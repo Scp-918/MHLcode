@@ -11,10 +11,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy.signal import find_peaks
 
 from udeco_analysis import _repair_pydisplay_sequence, load_udeco_sample
-from udeco_edge_detection import CascadeStateConfig, estimate_context_trend, median_clean
+from udeco_edge_detection import (CascadeStateConfig, estimate_context_trend,
+                                  median_clean, merge_candidate_fragments)
 
 
 @dataclass(frozen=True)
@@ -171,3 +173,154 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
                          "right_idx": peak["roi_right_idx"],
                          "peak_indices": [peak["peak_idx"]], "source_peaks": [peak]})
     return rois, peaks
+
+
+def _window_change(values: np.ndarray, width: int) -> np.ndarray:
+    """Right median minus left median at a sample boundary; width 1 is diff."""
+    result = np.zeros(len(values), dtype=float)
+    if 2 * width > len(values):
+        return result
+    medians = np.median(sliding_window_view(values, width), axis=1)
+    centers = np.arange(width, len(values) - width + 1)
+    result[centers] = medians[centers] - medians[centers - width]
+    return result
+
+
+def _detector_scales(values: np.ndarray, widths: list[tuple[int, int | float]],
+                     baseline_n: int) -> tuple[dict, dict, dict]:
+    responses, scores, sigmas = {}, {}, {}
+    for width, label in widths:
+        response = _window_change(values, width)
+        baseline = response[width:baseline_n-width+1]
+        sigma = float(np.std(baseline))
+        responses[label] = response
+        scores[label] = response / max(sigma, np.finfo(float).eps)
+        sigmas[label] = sigma
+    return responses, scores, sigmas
+
+
+def _best_signed_score(scale_scores: dict, n: int) -> np.ndarray:
+    best = np.zeros(n, dtype=float)
+    for row in scale_scores.values():
+        stronger = np.abs(row) > np.abs(best)
+        best[stronger] = row[stronger]
+    return best
+
+
+def _score_regions(score: np.ndarray, roi: dict, threshold: float,
+                   merge_points: int) -> list[np.ndarray]:
+    lo, hi = roi["left_idx"], roi["right_idx"]
+    active = np.arange(lo, hi + 1)
+    active = active[np.abs(score[active]) >= threshold]
+    if not len(active):
+        return []
+    groups = [[int(active[0])]]
+    for index in active[1:]:
+        previous = groups[-1][-1]
+        if index - previous <= merge_points and np.sign(score[index]) == np.sign(score[previous]):
+            groups[-1].append(int(index))
+        else:
+            groups.append([int(index)])
+    return [np.asarray(group, dtype=int) for group in groups]
+
+
+def _median_candidates(scores: dict, combined: np.ndarray, roi: dict,
+                       fs: float, config: ExperimentConfig) -> list[dict]:
+    regions = _score_regions(combined, roi, config.edge_score_sigma,
+                             max(1, round(config.candidate_merge_sec * fs)))
+    candidates = []
+    for indices in regions:
+        center = int(indices[np.argmax(np.abs(combined[indices]))])
+        candidates.append({"roi_id": roi["roi_id"], "center_idx": center,
+                           "region_start_idx": int(indices[0]),
+                           "region_end_idx": int(indices[-1]),
+                           "direction": int(np.sign(combined[center])),
+                           "detector_score": float(abs(combined[center])),
+                           "detector_name": "median_diff"})
+    return candidates
+
+
+def _haar_candidates(values: np.ndarray, scores: dict, combined: np.ndarray,
+                     derivative_score: np.ndarray, roi: dict, fs: float,
+                     config: ExperimentConfig) -> list[dict]:
+    primitive = []
+    groups = _score_regions(combined, roi, config.edge_score_sigma,
+                            max(1, round(config.haar_merge_sec * fs)))
+    for indices in groups:
+        center = int(indices[np.argmax(np.abs(combined[indices]))])
+        direction = int(np.sign(combined[center]))
+        support = [scale for scale, row in scores.items()
+                   if np.any(direction * row[indices] >= config.edge_score_sigma)]
+        peak_score = float(max(direction * scores[s][indices].max() if direction > 0
+                               else -scores[s][indices].min() for s in support))
+        if len(support) < config.haar_min_scale_support and peak_score < config.haar_single_scale_sigma:
+            continue
+        fine_scale = min(support)
+        fine_indices = indices[np.argmax(direction * scores[fine_scale][indices])]
+        primitive.append({"center_index": int(fine_indices),
+                          "coarse_start_index": int(indices[0]),
+                          "coarse_end_index": int(indices[-1]),
+                          "best_scale_s": float(fine_scale),
+                          "edge_score": direction * peak_score,
+                          "noise_scale": 1.0,
+                          "support_scales_s": tuple(support),
+                          "detection_channels": ("haar",)})
+    derivative_groups = _score_regions(derivative_score, roi,
+                                       config.haar_derivative_sigma, 1)
+    for indices in derivative_groups:
+        center = int(indices[np.argmax(np.abs(derivative_score[indices]))])
+        primitive.append({"center_index": center,
+                          "coarse_start_index": int(indices[0]),
+                          "coarse_end_index": int(indices[-1]),
+                          "best_scale_s": 1.0 / fs,
+                          "edge_score": float(derivative_score[center]),
+                          "noise_scale": 1.0, "support_scales_s": (),
+                          "detection_channels": ("derivative",)})
+    merge_config = CascadeStateConfig(
+        edge_fragment_merge_s=config.haar_fragment_merge_sec,
+        edge_fragment_min_spearman=config.haar_fragment_min_spearman,
+        edge_fragment_min_forward_fraction=config.haar_fragment_min_forward_fraction)
+    merged = merge_candidate_fragments(values, primitive, fs, merge_config)
+    return [{"roi_id": roi["roi_id"], "center_idx": int(row["center_index"]),
+             "region_start_idx": int(row["coarse_start_index"]),
+             "region_end_idx": int(row["coarse_end_index"]),
+             "direction": int(np.sign(row["edge_score"])),
+             "detector_score": float(abs(row["edge_score"])),
+             "detector_name": "haar",
+             "fragment_centers": row["fragment_centers"]} for row in merged]
+
+
+def detect_roi_candidates(edge_signal: np.ndarray, rois: list[dict], *, fs: float,
+                          config: ExperimentConfig) -> tuple[list[dict], dict]:
+    """Find candidates within Uh ROIs, normalized only by first-15-s noise."""
+    values = np.asarray(edge_signal, dtype=float)
+    baseline_n = round(config.baseline_sec * fs)
+    if len(values) < baseline_n or baseline_n < 3:
+        raise ValueError("recording must contain the complete baseline interval")
+    if config.edge_detector == "median_diff":
+        widths = [(int(width), int(width)) for width in config.median_diff_windows]
+    elif config.edge_detector == "haar":
+        widths = [(max(2, round(scale * fs)), float(scale))
+                  for scale in config.haar_scales_sec if 2 * round(scale * fs) <= len(values)]
+    else:
+        raise ValueError(f"unknown EDGE_DETECTOR: {config.edge_detector}")
+    responses, scores, sigmas = _detector_scales(values, widths, baseline_n)
+    combined = _best_signed_score(scores, len(values))
+    diagnostics = {"scale_responses": responses, "scale_scores": scores,
+                   "scale_sigmas": sigmas, "combined_score": combined,
+                   "threshold": config.edge_score_sigma,
+                   "detector_name": config.edge_detector}
+    candidates = []
+    if config.edge_detector == "haar":
+        derivative = np.zeros(len(values), dtype=float)
+        difference = np.diff(values)
+        sigma_du = float(np.std(difference[:baseline_n-1]))
+        derivative[1:] = difference / max(sigma_du, np.finfo(float).eps)
+        diagnostics["derivative_score"] = derivative
+    for roi in rois:
+        if config.edge_detector == "median_diff":
+            candidates.extend(_median_candidates(scores, combined, roi, fs, config))
+        else:
+            candidates.extend(_haar_candidates(values, scores, combined, derivative,
+                                               roi, fs, config))
+    return sorted(candidates, key=lambda item: (item["roi_id"], item["center_idx"])), diagnostics
