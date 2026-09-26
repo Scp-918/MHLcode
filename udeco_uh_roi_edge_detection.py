@@ -324,3 +324,150 @@ def detect_roi_candidates(edge_signal: np.ndarray, rois: list[dict], *, fs: floa
             candidates.extend(_haar_candidates(values, scores, combined, derivative,
                                                roi, fs, config))
     return sorted(candidates, key=lambda item: (item["roi_id"], item["center_idx"])), diagnostics
+
+
+def _unresolved(candidate: dict, reason: str, **measurements) -> dict:
+    return {**candidate, **measurements, "resolved": False, "reason": reason}
+
+
+def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
+                            candidates: list[dict], rois: list[dict], *, fs: float,
+                            noise: dict[str, float], config: ExperimentConfig) -> list[dict]:
+    """Measure each candidate on Udeco; detector region width is never duration."""
+    clean = np.asarray(clean, dtype=float)
+    edge_signal = np.asarray(edge_signal, dtype=float)
+    derivative = np.diff(edge_signal)
+    roi_by_id = {roi["roi_id"]: roi for roi in rois}
+    radius = max(1, round(config.localize_search_sec * fs))
+    pre_points = max(1, round(config.pre_plateau_sec * fs))
+    post_points = max(1, round(config.post_plateau_sec * fs))
+    settle_points = max(1, round(config.settle_window_sec * fs))
+    hold_points = max(1, round(config.settle_hold_sec * fs))
+    result = []
+    for candidate in candidates:
+        roi = roi_by_id[candidate["roi_id"]]
+        left, right = int(roi["left_idx"]), int(roi["right_idx"])
+        center = int(candidate["center_idx"])
+        direction = int(candidate["direction"])
+        lo = max(left, center - radius - 1)
+        hi = min(right - 1, center + radius)
+        if hi < lo:
+            result.append(_unresolved(candidate, "no_derivative_window"))
+            continue
+        peak_k = lo + int(np.argmax(direction * derivative[lo:hi+1]))
+        peak = float(derivative[peak_k])
+        if direction * peak < config.deriv_sigma_k * noise["sigma_du"]:
+            result.append(_unresolved(candidate, "weak_derivative",
+                                      derivative_peak_idx=peak_k + 1,
+                                      derivative_peak=peak))
+            continue
+        core_threshold = max(config.deriv_sigma_k * noise["sigma_du"],
+                             config.deriv_core_ratio * abs(peak))
+        start_idx = peak_k
+        while start_idx > left and direction * derivative[start_idx-1] >= core_threshold:
+            start_idx -= 1
+        core_end_idx = None
+        low_run = 0
+        for k in range(peak_k + 1, right):
+            low_run = low_run + 1 if abs(derivative[k]) < core_threshold else 0
+            if low_run >= config.core_end_min_points:
+                core_end_idx = k - low_run + 1
+                break
+        partial = {"start_idx": start_idx, "core_end_idx": core_end_idx,
+                   "derivative_peak_idx": peak_k + 1, "derivative_peak": peak,
+                   "core_threshold": core_threshold}
+        if core_end_idx is None:
+            result.append(_unresolved(candidate, "core_does_not_end", **partial))
+            continue
+        if start_idx - pre_points + 1 < left:
+            result.append(_unresolved(candidate, "missing_pre_plateau", **partial))
+            continue
+        pre_values = clean[start_idx-pre_points+1:start_idx+1]
+        pre_level = float(np.median(pre_values))
+        if np.median(np.abs(pre_values - pre_level)) > config.plateau_sigma_k * noise["sigma_udeco"]:
+            result.append(_unresolved(candidate, "unstable_pre_plateau", **partial))
+            continue
+        settle_limit = config.settle_deriv_sigma_k * noise["sigma_du"]
+        stable_run = 0
+        stable_start = None
+        settle_end_idx = None
+        for k in range(core_end_idx, right - settle_points + 1):
+            stable = np.median(np.abs(derivative[k:k+settle_points])) < settle_limit
+            if stable:
+                stable_run += 1
+                if stable_start is None:
+                    stable_start = k
+                if stable_run >= hold_points:
+                    settle_end_idx = stable_start
+                    break
+            else:
+                stable_run = 0
+                stable_start = None
+        if settle_end_idx is None:
+            result.append(_unresolved(candidate, "not_settled_in_roi", **partial))
+            continue
+        partial["settle_end_idx"] = settle_end_idx
+        if settle_end_idx + post_points > right:
+            result.append(_unresolved(candidate, "missing_post_plateau", **partial))
+            continue
+        post_values = clean[settle_end_idx+1:settle_end_idx+1+post_points]
+        post_level = float(np.median(post_values))
+        if np.median(np.abs(post_values - post_level)) > config.plateau_sigma_k * noise["sigma_udeco"]:
+            result.append(_unresolved(candidate, "unstable_post_plateau", **partial))
+            continue
+        half_peak = abs(peak) / 2
+        fwhm_left = peak_k
+        while fwhm_left > left and direction * derivative[fwhm_left-1] >= half_peak:
+            fwhm_left -= 1
+        fwhm_right = peak_k
+        while fwhm_right < right-1 and direction * derivative[fwhm_right+1] >= half_peak:
+            fwhm_right += 1
+        delta = post_level - pre_level
+        signed_core_steps = direction * derivative[start_idx:core_end_idx]
+        result.append({**candidate, **partial, "resolved": True, "reason": None,
+                       "pre_level": pre_level, "post_level": post_level,
+                       "delta": delta, "amplitude": abs(delta),
+                       "T_core": (core_end_idx - start_idx) / fs,
+                       "T_tail": (settle_end_idx - core_end_idx) / fs,
+                       "normalized_derivative_peak": abs(peak) / max(noise["sigma_du"], np.finfo(float).eps),
+                       "derivative_peak_width": (fwhm_right - fwhm_left + 1) / fs,
+                       "derivative_fwhm_left_idx": fwhm_left,
+                       "derivative_fwhm_right_idx": fwhm_right + 1,
+                       "monotonicity": float(np.mean(signed_core_steps >= -config.deriv_sigma_k * noise["sigma_du"])),
+                       "baseline_snr": abs(delta) / max(noise["sigma_udeco"], np.finfo(float).eps)})
+    return result
+
+
+def build_event_table(localized: list[dict], rois: list[dict], *, channel: str,
+                      sigma_udeco: float, config: ExperimentConfig,
+                      direction_map: dict[int, dict[str, str]]) -> pd.DataFrame:
+    """Keep all candidates but designate only the largest rise/fall per ROI."""
+    rows = []
+    for item in localized:
+        row = {**item, "channel": channel, "is_main_rising": False,
+               "is_main_falling": False, "morphology": None, "event_label": None}
+        if item.get("resolved"):
+            shape = "sharp" if item["T_core"] <= config.sharp_core_duration_sec else "gradual"
+            row["morphology"] = ("sharp_long_tail" if shape == "sharp"
+                                  and item["T_tail"] >= config.long_tail_sec else shape)
+            row["derivative_support"] = (item["derivative_peak_width"] <= config.deriv_peak_width_threshold_sec
+                                         and item["normalized_derivative_peak"] >= config.deriv_peak_sigma_k)
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return pd.DataFrame(columns=["channel", "roi_id", "center_idx", "direction", "delta",
+                                     "resolved", "is_main_rising", "is_main_falling",
+                                     "morphology", "event_label"])
+    for roi in rois:
+        for direction, column in ((1, "is_main_rising"), (-1, "is_main_falling")):
+            eligible = table.loc[(table.roi_id == roi["roi_id"])
+                                 & (table.resolved == True)
+                                 & (table.direction == direction)
+                                 & (direction * table.delta >= config.min_amplitude_sigma_k * sigma_udeco)]
+            if eligible.empty:
+                continue
+            selected = eligible.delta.abs().idxmax()
+            table.at[selected, column] = True
+            shape = "sharp" if table.at[selected, "T_core"] <= config.sharp_core_duration_sec else "gradual"
+            table.at[selected, "event_label"] = direction_map[direction][shape]
+    return table
