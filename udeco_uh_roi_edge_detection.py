@@ -26,7 +26,7 @@ class ExperimentConfig:
     context_robust_iters: int = 1
     baseline_sec: float = 15.0
     uh_peak_prominence_sigma: float = 4.0
-    uh_peak_height_sigma: float = 5.0
+    uh_peak_to_coarse_l_sigma: float = 10.0
     uh_peak_distance_sec: float = 0.30
     uh_flat_slope_sigma: float = 2.0
     uh_flat_min_sec: float = 0.05
@@ -134,17 +134,20 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
     """Detect positive Uh peaks, refine their boundaries, and merge ROI overlaps."""
     values = np.asarray(edge_signal, dtype=float)
     prominence = config.uh_peak_prominence_sigma * sigma_uh
-    height = config.uh_peak_height_sigma * sigma_uh
+    coarse_left_rise_threshold = config.uh_peak_to_coarse_l_sigma * sigma_uh
     distance = max(1, round(config.uh_peak_distance_sec * fs))
     peaks = []
-    indices, props = find_peaks(values, prominence=prominence, height=height,
+    indices, props = find_peaks(values, prominence=prominence,
                                 distance=distance, plateau_size=1)
     for position, peak_idx in enumerate(indices):
-        if values[peak_idx] <= height:
+        coarse_left_idx = int(props["left_bases"][position])
+        coarse_left_rise = float(values[peak_idx] - values[coarse_left_idx])
+        if coarse_left_rise <= coarse_left_rise_threshold:
             continue
         peaks.append({"peak_idx": int(peak_idx), "sign": 1,
                       "prominence": float(props["prominences"][position]),
-                      "coarse_left_idx": int(props["left_bases"][position]),
+                      "coarse_left_rise": coarse_left_rise,
+                      "coarse_left_idx": coarse_left_idx,
                       "coarse_right_idx": int(props["right_bases"][position]),
                       "plateau_left_idx": int(props["left_edges"][position]),
                       "plateau_right_idx": int(props["right_edges"][position])})

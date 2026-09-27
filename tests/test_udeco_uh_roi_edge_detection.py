@@ -56,24 +56,29 @@ def test_overlapping_peak_rois_merge_and_keep_source_peaks():
     assert rois[0]["right_idx"] >= 151
 
 
-def test_uh_rois_require_positive_peak_strictly_above_configured_baseline_height():
-    signal = np.zeros(300)
-    signal[40] = 4.5
-    signal[90] = 5.0
-    signal[140] = 6.0
-    signal[220] = -8.0
+def test_uh_rois_require_positive_peak_rise_above_coarse_left_base():
+    signal = np.full(300, 20.0)
+    signal[40] = 29.0
+    signal[90] = 30.0
+    signal[140] = 31.0
+    signal[220] = 0.0
     config = ExperimentConfig(uh_peak_prominence_sigma=2.0,
-                              uh_peak_height_sigma=5.0)
+                              uh_peak_to_coarse_l_sigma=10.0)
 
     rois, peaks = find_uh_rois(signal, fs=100, sigma_uh=1.0,
                                sigma_duh=1.0, config=config)
     assert [peak["peak_idx"] for peak in peaks] == [140]
+    assert peaks[0]["coarse_left_rise"] == 11.0
     assert len(rois) == 1
+
+    _, shifted_peaks = find_uh_rois(signal + 100.0, fs=100, sigma_uh=1.0,
+                                   sigma_duh=1.0, config=config)
+    assert [peak["peak_idx"] for peak in shifted_peaks] == [140]
 
     _, stricter_peaks = find_uh_rois(signal, fs=100, sigma_uh=1.0,
                                     sigma_duh=1.0,
                                     config=ExperimentConfig(uh_peak_prominence_sigma=2.0,
-                                                            uh_peak_height_sigma=7.0))
+                                                            uh_peak_to_coarse_l_sigma=12.0))
     assert stricter_peaks == []
 
 
