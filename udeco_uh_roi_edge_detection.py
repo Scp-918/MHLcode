@@ -187,7 +187,7 @@ def _refined_boundary(values: np.ndarray, start: int, stop: int, step: int,
 def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
                  sigma_duh: float, motion_interval: dict, f0_hz: float,
                  config: ExperimentConfig) -> tuple[list[dict], list[dict]]:
-    """Find motion-only positive peaks and build period-aware, disjoint ROIs."""
+    """Find motion-only positive peaks and one ROI per distance-selected main peak."""
     values = np.asarray(edge_signal, dtype=float)
     prominence = config.uh_peak_prominence_sigma * sigma_uh
     coarse_mean_rise_threshold = config.uh_peak_to_coarse_mean_sigma * sigma_uh
@@ -195,9 +195,13 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
         raise ValueError("f0_hz must be positive")
     motion_start = motion_interval["start_idx"]
     motion_end = motion_interval["end_idx"]
+    segment = values[motion_start:motion_end]
+    distance_points = max(1, int(np.ceil(config.uh_peak_period_fraction * fs / f0_hz)))
+    main_indices, _ = find_peaks(segment, prominence=prominence, plateau_size=1,
+                                 distance=distance_points)
+    main_indices = set(main_indices + motion_start)
     peaks = []
-    indices, props = find_peaks(values[motion_start:motion_end],
-                                prominence=prominence, plateau_size=1)
+    indices, props = find_peaks(segment, prominence=prominence, plateau_size=1)
     for position, local_peak_idx in enumerate(indices):
         peak_idx = int(local_peak_idx + motion_start)
         coarse_left_idx = int(props["left_bases"][position] + motion_start)
@@ -207,6 +211,7 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
         if coarse_mean_rise <= coarse_mean_rise_threshold:
             continue
         peaks.append({"peak_idx": int(peak_idx), "sign": 1,
+                      "is_main": peak_idx in main_indices, "roi_id": None,
                       "prominence": float(props["prominences"][position]),
                       "coarse_mean_rise": coarse_mean_rise,
                       "coarse_left_idx": coarse_left_idx,
@@ -214,14 +219,15 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
                       "plateau_left_idx": int(props["left_edges"][position] + motion_start),
                       "plateau_right_idx": int(props["right_edges"][position] + motion_start)})
     peaks.sort(key=lambda row: row["peak_idx"])
+    main_peaks = [peak for peak in peaks if peak["is_main"]]
     flat_points = max(1, round(config.uh_flat_min_sec * fs))
-    for position, peak in enumerate(peaks):
+    for position, peak in enumerate(main_peaks):
         left_limit = peak["coarse_left_idx"]
         right_limit = peak["coarse_right_idx"]
         if position:
-            left_limit = max(left_limit, (peaks[position-1]["peak_idx"] + peak["peak_idx"]) // 2)
-        if position + 1 < len(peaks):
-            right_limit = min(right_limit, (peak["peak_idx"] + peaks[position+1]["peak_idx"]) // 2)
+            left_limit = max(left_limit, (main_peaks[position-1]["peak_idx"] + peak["peak_idx"]) // 2)
+        if position + 1 < len(main_peaks):
+            right_limit = min(right_limit, (peak["peak_idx"] + main_peaks[position+1]["peak_idx"]) // 2)
         peak["refined_left_idx"] = _refined_boundary(
             values, peak["plateau_left_idx"], left_limit, -1, peak["sign"],
             config.uh_flat_slope_sigma * sigma_duh, flat_points,
@@ -230,41 +236,35 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
             values, peak["plateau_right_idx"], right_limit, 1, peak["sign"],
             config.uh_flat_slope_sigma * sigma_duh, flat_points,
             config.uh_peak_prominence_sigma * sigma_uh)
-    rois = _group_uh_peaks(values, peaks, fs=fs, period_fraction=config.uh_peak_period_fraction,
-                           f0_hz=f0_hz)
+    rois = _main_peak_rois(values, main_peaks, peaks, fs=fs, f0_hz=f0_hz)
     lead_points = round(config.udeco_left_lead_sec * fs)
     for roi in rois:
         roi["search_left_idx"] = max(0, roi["left_idx"] - lead_points)
     return rois, peaks
 
 
-def _group_uh_peaks(values: np.ndarray, peaks: list[dict], *, fs: float,
-                    period_fraction: float, f0_hz: float) -> list[dict]:
-    """Group sub-period peaks, then split overlapping groups at their valley."""
-    groups: list[list[dict]] = []
-    max_gap_sec = period_fraction / f0_hz
-    for peak in peaks:
-        if groups and (peak["peak_idx"] - groups[-1][-1]["peak_idx"]) / fs < max_gap_sec:
-            groups[-1].append(peak)
-        else:
-            groups.append([peak])
-    rois = []
-    for group in groups:
-        main_peak = max(group, key=lambda item: item["coarse_mean_rise"])
-        rois.append({"roi_id": f"ROI_{len(rois)}",
-                     "left_idx": min(item["refined_left_idx"] for item in group),
-                     "right_idx": max(item["refined_right_idx"] for item in group),
-                     "main_peak_idx": main_peak["peak_idx"],
-                     "peak_indices": [item["peak_idx"] for item in group],
-                     "source_peaks": group, "split_right_idx": None})
+def _main_peak_rois(values: np.ndarray, main_peaks: list[dict], peaks: list[dict], *,
+                    fs: float, f0_hz: float) -> list[dict]:
+    """Cover nearby peak cycles and leave long gaps outside the ROIs."""
+    rois = [{"roi_id": f"ROI_{i}", "left_idx": peak["refined_left_idx"],
+             "right_idx": peak["refined_right_idx"], "main_peak_idx": peak["peak_idx"],
+             "peak_indices": [], "source_peaks": [], "split_right_idx": None}
+            for i, peak in enumerate(main_peaks)]
     for earlier, later in zip(rois, rois[1:]):
-        if earlier["right_idx"] >= later["left_idx"]:
-            start = earlier["peak_indices"][-1]
-            end = later["peak_indices"][0]
-            valley = start + int(np.argmin(values[start:end + 1]))
+        start, end = earlier["main_peak_idx"], later["main_peak_idx"]
+        short_gap = (end - start) / fs <= 1.5 / f0_hz
+        if short_gap or earlier["right_idx"] >= later["left_idx"]:
+            valley = start + 1 + int(np.argmin(values[start + 1:end]))
             earlier["right_idx"] = valley
             earlier["split_right_idx"] = valley
             later["left_idx"] = valley + 1
+    for peak in peaks:
+        for roi in rois:
+            if roi["left_idx"] <= peak["peak_idx"] <= roi["right_idx"]:
+                peak["roi_id"] = roi["roi_id"]
+                roi["peak_indices"].append(peak["peak_idx"])
+                roi["source_peaks"].append(peak)
+                break
     return rois
 
 
