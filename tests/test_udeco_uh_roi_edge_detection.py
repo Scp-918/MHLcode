@@ -6,12 +6,15 @@ import numpy as np
 
 from udeco_uh_roi_edge_detection import (
     ExperimentConfig,
+    _group_uh_peaks,
     baseline_sigmas,
     build_event_table,
     detect_roi_candidates,
     find_uh_rois,
+    estimate_motion_frequency,
     load_paired_sample,
     localize_roi_candidates,
+    resolve_motion_interval,
 )
 
 
@@ -36,7 +39,7 @@ def test_baseline_sigmas_ignore_events_after_first_fifteen_seconds():
     assert np.isclose(first["sigma_du"], np.std(np.diff(udeco[:150])))
 
 
-def test_overlapping_peak_rois_merge_and_keep_source_peaks():
+def test_short_period_peaks_group_and_keep_source_peaks():
     x = np.zeros(300)
     x[100:111] = np.linspace(0, 5, 11)
     x[111:122] = np.linspace(4.5, 0, 11)
@@ -44,14 +47,15 @@ def test_overlapping_peak_rois_merge_and_keep_source_peaks():
     x[141:152] = np.linspace(3.6, 0, 11)
     cfg = ExperimentConfig(
         uh_peak_prominence_sigma=2,
-        uh_peak_distance_sec=0.05,
-        uh_roi_margin_sec=0.20,
     )
-    rois, peaks = find_uh_rois(x, fs=100, sigma_uh=0.1, sigma_duh=0.1, config=cfg)
+    rois, peaks = find_uh_rois(x, fs=100, sigma_uh=0.1, sigma_duh=0.1,
+                               motion_interval={"start_idx": 0, "end_idx": 300},
+                               f0_hz=1.0, config=cfg)
     assert len(peaks) == 2
     assert len(rois) == 1
     assert rois[0]["roi_id"] == "ROI_0"
     assert len(rois[0]["peak_indices"]) == 2
+    assert rois[0]["main_peak_idx"] == 110
     assert rois[0]["left_idx"] <= 100
     assert rois[0]["right_idx"] >= 151
 
@@ -66,20 +70,60 @@ def test_uh_rois_require_positive_peak_rise_above_coarse_left_base():
                               uh_peak_to_coarse_l_sigma=10.0)
 
     rois, peaks = find_uh_rois(signal, fs=100, sigma_uh=1.0,
-                               sigma_duh=1.0, config=config)
+                               sigma_duh=1.0,
+                               motion_interval={"start_idx": 0, "end_idx": 300},
+                               f0_hz=1.0, config=config)
     assert [peak["peak_idx"] for peak in peaks] == [140]
     assert peaks[0]["coarse_left_rise"] == 11.0
     assert len(rois) == 1
 
     _, shifted_peaks = find_uh_rois(signal + 100.0, fs=100, sigma_uh=1.0,
-                                   sigma_duh=1.0, config=config)
+                                   sigma_duh=1.0,
+                                   motion_interval={"start_idx": 0, "end_idx": 300},
+                                   f0_hz=1.0, config=config)
     assert [peak["peak_idx"] for peak in shifted_peaks] == [140]
 
     _, stricter_peaks = find_uh_rois(signal, fs=100, sigma_uh=1.0,
                                     sigma_duh=1.0,
+                                    motion_interval={"start_idx": 0, "end_idx": 300},
+                                    f0_hz=1.0,
                                     config=ExperimentConfig(uh_peak_prominence_sigma=2.0,
                                                             uh_peak_to_coarse_l_sigma=12.0))
     assert stricter_peaks == []
+
+
+def test_motion_interval_and_fft_are_channel_local_and_motion_only():
+    fs = 100
+    time = np.arange(4000) / fs
+    signal = np.sin(2 * np.pi * 2 * time)
+    motion = {"start_idx": 1000, "end_idx": 3000}
+    spectrum = estimate_motion_frequency(signal, fs=fs, motion_interval=motion)
+    assert abs(spectrum["f0_hz"] - 2.0) < 0.05
+    assert estimate_motion_frequency(signal, fs=fs, motion_interval=motion,
+                                     override_hz=1.5)["f0_hz"] == 1.5
+    sample = {"fs": fs, "time_s": time}
+    assert resolve_motion_interval(sample, baseline_sec=15.0,
+                                   manual_start_sec=10, manual_end_sec=30)["end_idx"] == 3000
+    spikes = np.zeros(4000)
+    spikes[[500, 1100, 1120, 1200, 3500]] = 3
+    rois, peaks = find_uh_rois(spikes, fs=fs, sigma_uh=0.1, sigma_duh=0.1,
+                               motion_interval=motion, f0_hz=2.0, config=ExperimentConfig())
+    assert [peak["peak_idx"] for peak in peaks] == [1100, 1120, 1200]
+    assert [roi["peak_indices"] for roi in rois] == [[1100, 1120], [1200]]
+
+
+def test_period_equality_stays_separate_and_overlap_splits_at_valley():
+    values = np.zeros(100)
+    values[35] = -2
+    peaks = [{"peak_idx": idx, "refined_left_idx": left,
+              "refined_right_idx": right, "coarse_left_rise": rise}
+             for idx, left, right, rise in ((10, 8, 23, 5), (20, 15, 45, 6),
+                                            (45, 22, 55, 4))]
+    rois = _group_uh_peaks(values, peaks, fs=100, period_fraction=0.5, f0_hz=2)
+    assert [roi["peak_indices"] for roi in rois] == [[10, 20], [45]]
+    assert rois[0]["right_idx"] == 35
+    assert rois[1]["left_idx"] == 36
+    assert rois[0]["right_idx"] < rois[1]["left_idx"]
 
 
 def test_median_difference_detects_one_sample_steps_only_inside_roi():
@@ -182,15 +226,16 @@ def test_roi_selects_only_largest_actual_rise_and_fall():
     assert table.loc[table.center_idx == 100, "is_main_rising"].item() == False
 
 
-def test_slow_uh_peak_roi_contains_both_true_event_boundaries():
+def test_single_slow_uh_peak_uses_refined_bounds_without_margin():
     uh = np.zeros(300)
     uh[100:151] = np.linspace(0, 5, 51)
     uh[151:202] = np.linspace(4.9, 0, 51)
-    rois, _ = find_uh_rois(uh, fs=100, sigma_uh=0.1, sigma_duh=0.1,
+    rois, peaks = find_uh_rois(uh, fs=100, sigma_uh=0.1, sigma_duh=0.1,
+                           motion_interval={"start_idx": 0, "end_idx": 300}, f0_hz=1.0,
                            config=ExperimentConfig())
     assert len(rois) == 1
-    assert rois[0]["left_idx"] <= 100
-    assert rois[0]["right_idx"] >= 201
+    assert rois[0]["left_idx"] == peaks[0]["refined_left_idx"]
+    assert rois[0]["right_idx"] == peaks[0]["refined_right_idx"]
 
 
 def test_nearby_candidate_centers_localize_distinct_steps():

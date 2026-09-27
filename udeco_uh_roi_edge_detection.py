@@ -14,7 +14,8 @@ import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.signal import find_peaks
 
-from udeco_analysis import _repair_pydisplay_sequence, load_udeco_sample
+from udeco_analysis import (AnalysisConfig, _repair_pydisplay_sequence,
+                            detect_motion_stage, load_udeco_sample)
 from udeco_edge_detection import (CascadeStateConfig, estimate_context_trend,
                                   median_clean, merge_candidate_fragments)
 
@@ -27,10 +28,12 @@ class ExperimentConfig:
     baseline_sec: float = 15.0
     uh_peak_prominence_sigma: float = 4.0
     uh_peak_to_coarse_l_sigma: float = 10.0
-    uh_peak_distance_sec: float = 0.30
+    uh_peak_period_fraction: float = 0.5
     uh_flat_slope_sigma: float = 2.0
     uh_flat_min_sec: float = 0.05
-    uh_roi_margin_sec: float = 0.15
+    fft_min_hz: float = 0.5
+    fft_max_hz: float = 5.0
+    udeco_left_lead_sec: float = 0.03
     edge_detector: str = "median_diff"
     median_diff_windows: tuple[int, ...] = (1, 3, 5, 7)
     edge_score_sigma: float = 3.5
@@ -74,7 +77,59 @@ def load_paired_sample(sensor_csv: str | Path, *, data_root: str | Path, fs: int
         raise ValueError("Uh and Udeco repaired sample axes disagree")
     return {"sample_name": loaded.sample_name, "subject": loaded.subject,
             "time_s": loaded.time_s, "fs": loaded.fs, "signals": signals,
+            "acc": {"ACC_X": loaded.accx, "ACC_Y": loaded.accy, "ACC_Z": loaded.accz},
             "metadata": loaded.metadata}
+
+
+def resolve_motion_interval(sample: dict, *, baseline_sec: float,
+                            manual_start_sec: float | None = None,
+                            manual_end_sec: float | None = None) -> dict:
+    """Return one half-open motion interval, with optional manual bounds."""
+    fs = sample["fs"]
+    if (manual_start_sec is None) != (manual_end_sec is None):
+        raise ValueError("set both manual motion start and end, or neither")
+    if manual_start_sec is None:
+        acc = sample["acc"]
+        result = detect_motion_stage(acc["ACC_X"], acc["ACC_Y"], acc["ACC_Z"],
+                                     fs=fs, config=AnalysisConfig(motion_calibration_sec=baseline_sec))
+        if result["status"] != "ok":
+            raise ValueError(f"ACC motion detection failed: {result['reason']}; set manual motion bounds")
+        start_sec, end_sec = result["motion_start_s"], result["motion_end_s"]
+        source = "acc"
+    else:
+        start_sec, end_sec = manual_start_sec, manual_end_sec
+        source = "manual"
+    left, right = round(start_sec * fs), round(end_sec * fs)
+    if not 0 <= left < right <= len(sample["time_s"]):
+        raise ValueError("motion interval must lie inside the recording")
+    return {"start_idx": left, "end_idx": right, "start_sec": left / fs,
+            "end_sec": right / fs, "source": source}
+
+
+def estimate_motion_frequency(edge_signal: np.ndarray, *, fs: float,
+                              motion_interval: dict, min_hz: float = 0.5,
+                              max_hz: float = 5.0,
+                              override_hz: float | None = None) -> dict:
+    """Use the strongest Hann-window FFT bin as the motion-frequency candidate."""
+    values = np.asarray(edge_signal, dtype=float)
+    start, end = motion_interval["start_idx"], motion_interval["end_idx"]
+    segment = values[start:end] - np.mean(values[start:end])
+    if len(segment) < 3:
+        raise ValueError("motion interval is too short for an FFT")
+    frequencies = np.fft.rfftfreq(len(segment), d=1 / fs)
+    power = np.abs(np.fft.rfft(segment * np.hanning(len(segment)))) ** 2
+    band = (frequencies >= min_hz) & (frequencies <= max_hz)
+    if not np.any(band):
+        raise ValueError("FFT band has no frequency bins")
+    band_indices = np.flatnonzero(band)
+    dominant = int(band_indices[np.argmax(power[band])])
+    if power[dominant] <= 0 and override_hz is None:
+        raise ValueError("motion Uh spectrum has no usable peak; set an f0 override")
+    if override_hz is not None and override_hz <= 0:
+        raise ValueError("f0 override must be positive")
+    return {"f0_hz": float(override_hz if override_hz is not None else frequencies[dominant]),
+            "fft_peak_hz": float(frequencies[dominant]), "frequencies_hz": frequencies,
+            "power": power, "source": "manual" if override_hz is not None else "fft"}
 
 
 def preprocess_channel(raw: np.ndarray, fs: float, config: ExperimentConfig) -> dict:
@@ -130,17 +185,22 @@ def _refined_boundary(values: np.ndarray, start: int, stop: int, step: int,
 
 
 def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
-                 sigma_duh: float, config: ExperimentConfig) -> tuple[list[dict], list[dict]]:
-    """Detect positive Uh peaks, refine their boundaries, and merge ROI overlaps."""
+                 sigma_duh: float, motion_interval: dict, f0_hz: float,
+                 config: ExperimentConfig) -> tuple[list[dict], list[dict]]:
+    """Find motion-only positive peaks and build period-aware, disjoint ROIs."""
     values = np.asarray(edge_signal, dtype=float)
     prominence = config.uh_peak_prominence_sigma * sigma_uh
     coarse_left_rise_threshold = config.uh_peak_to_coarse_l_sigma * sigma_uh
-    distance = max(1, round(config.uh_peak_distance_sec * fs))
+    if f0_hz <= 0:
+        raise ValueError("f0_hz must be positive")
+    motion_start = motion_interval["start_idx"]
+    motion_end = motion_interval["end_idx"]
     peaks = []
-    indices, props = find_peaks(values, prominence=prominence,
-                                distance=distance, plateau_size=1)
-    for position, peak_idx in enumerate(indices):
-        coarse_left_idx = int(props["left_bases"][position])
+    indices, props = find_peaks(values[motion_start:motion_end],
+                                prominence=prominence, plateau_size=1)
+    for position, local_peak_idx in enumerate(indices):
+        peak_idx = int(local_peak_idx + motion_start)
+        coarse_left_idx = int(props["left_bases"][position] + motion_start)
         coarse_left_rise = float(values[peak_idx] - values[coarse_left_idx])
         if coarse_left_rise <= coarse_left_rise_threshold:
             continue
@@ -148,12 +208,11 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
                       "prominence": float(props["prominences"][position]),
                       "coarse_left_rise": coarse_left_rise,
                       "coarse_left_idx": coarse_left_idx,
-                      "coarse_right_idx": int(props["right_bases"][position]),
-                      "plateau_left_idx": int(props["left_edges"][position]),
-                      "plateau_right_idx": int(props["right_edges"][position])})
+                      "coarse_right_idx": int(props["right_bases"][position] + motion_start),
+                      "plateau_left_idx": int(props["left_edges"][position] + motion_start),
+                      "plateau_right_idx": int(props["right_edges"][position] + motion_start)})
     peaks.sort(key=lambda row: row["peak_idx"])
     flat_points = max(1, round(config.uh_flat_min_sec * fs))
-    margin = round(config.uh_roi_margin_sec * fs)
     for position, peak in enumerate(peaks):
         left_limit = peak["coarse_left_idx"]
         right_limit = peak["coarse_right_idx"]
@@ -169,20 +228,39 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
             values, peak["plateau_right_idx"], right_limit, 1, peak["sign"],
             config.uh_flat_slope_sigma * sigma_duh, flat_points,
             config.uh_peak_prominence_sigma * sigma_uh)
-        peak["roi_left_idx"] = max(0, peak["refined_left_idx"] - margin)
-        peak["roi_right_idx"] = min(len(values) - 1, peak["refined_right_idx"] + margin)
-    rois = []
-    for peak in sorted(peaks, key=lambda row: row["roi_left_idx"]):
-        if rois and peak["roi_left_idx"] <= rois[-1]["right_idx"]:
-            roi = rois[-1]
-            roi["right_idx"] = max(roi["right_idx"], peak["roi_right_idx"])
-            roi["peak_indices"].append(peak["peak_idx"])
-            roi["source_peaks"].append(peak)
-        else:
-            rois.append({"roi_id": f"ROI_{len(rois)}", "left_idx": peak["roi_left_idx"],
-                         "right_idx": peak["roi_right_idx"],
-                         "peak_indices": [peak["peak_idx"]], "source_peaks": [peak]})
+    rois = _group_uh_peaks(values, peaks, fs=fs, period_fraction=config.uh_peak_period_fraction,
+                           f0_hz=f0_hz)
     return rois, peaks
+
+
+def _group_uh_peaks(values: np.ndarray, peaks: list[dict], *, fs: float,
+                    period_fraction: float, f0_hz: float) -> list[dict]:
+    """Group sub-period peaks, then split overlapping groups at their valley."""
+    groups: list[list[dict]] = []
+    max_gap_sec = period_fraction / f0_hz
+    for peak in peaks:
+        if groups and (peak["peak_idx"] - groups[-1][-1]["peak_idx"]) / fs < max_gap_sec:
+            groups[-1].append(peak)
+        else:
+            groups.append([peak])
+    rois = []
+    for group in groups:
+        main_peak = max(group, key=lambda item: item["coarse_left_rise"])
+        rois.append({"roi_id": f"ROI_{len(rois)}",
+                     "left_idx": min(item["refined_left_idx"] for item in group),
+                     "right_idx": max(item["refined_right_idx"] for item in group),
+                     "main_peak_idx": main_peak["peak_idx"],
+                     "peak_indices": [item["peak_idx"] for item in group],
+                     "source_peaks": group, "split_right_idx": None})
+    for earlier, later in zip(rois, rois[1:]):
+        if earlier["right_idx"] >= later["left_idx"]:
+            start = earlier["peak_indices"][-1]
+            end = later["peak_indices"][0]
+            valley = start + int(np.argmin(values[start:end + 1]))
+            earlier["right_idx"] = valley
+            earlier["split_right_idx"] = valley
+            later["left_idx"] = valley + 1
+    return rois
 
 
 def _window_change(values: np.ndarray, width: int) -> np.ndarray:
