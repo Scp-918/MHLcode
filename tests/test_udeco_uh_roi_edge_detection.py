@@ -56,6 +56,27 @@ def test_overlapping_peak_rois_merge_and_keep_source_peaks():
     assert rois[0]["right_idx"] >= 151
 
 
+def test_uh_rois_require_positive_peak_strictly_above_configured_baseline_height():
+    signal = np.zeros(300)
+    signal[40] = 4.5
+    signal[90] = 5.0
+    signal[140] = 6.0
+    signal[220] = -8.0
+    config = ExperimentConfig(uh_peak_prominence_sigma=2.0,
+                              uh_peak_height_sigma=5.0)
+
+    rois, peaks = find_uh_rois(signal, fs=100, sigma_uh=1.0,
+                               sigma_duh=1.0, config=config)
+    assert [peak["peak_idx"] for peak in peaks] == [140]
+    assert len(rois) == 1
+
+    _, stricter_peaks = find_uh_rois(signal, fs=100, sigma_uh=1.0,
+                                    sigma_duh=1.0,
+                                    config=ExperimentConfig(uh_peak_prominence_sigma=2.0,
+                                                            uh_peak_height_sigma=7.0))
+    assert stricter_peaks == []
+
+
 def test_median_difference_detects_one_sample_steps_only_inside_roi():
     rng = np.random.default_rng(12)
     signal = rng.normal(0, 1e-4, 2500)
