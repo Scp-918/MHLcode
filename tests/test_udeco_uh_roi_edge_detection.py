@@ -60,35 +60,34 @@ def test_short_period_peaks_group_and_keep_source_peaks():
     assert rois[0]["right_idx"] >= 151
 
 
-def test_uh_rois_require_positive_peak_rise_above_coarse_left_base():
-    signal = np.full(300, 20.0)
-    signal[40] = 29.0
-    signal[90] = 30.0
-    signal[140] = 31.0
-    signal[220] = 0.0
-    config = ExperimentConfig(uh_peak_prominence_sigma=2.0,
-                              uh_peak_to_coarse_l_sigma=10.0)
+def test_uh_peak_must_exceed_mean_of_both_coarse_bases():
+    signal = np.full(30, 8.0)
+    signal[9] = 0.0
+    signal[15] = 10.0
+    config = ExperimentConfig(uh_peak_prominence_sigma=0.5,
+                              uh_peak_to_coarse_mean_sigma=7.0)
 
     rois, peaks = find_uh_rois(signal, fs=100, sigma_uh=1.0,
                                sigma_duh=1.0,
-                               motion_interval={"start_idx": 0, "end_idx": 300},
+                               motion_interval={"start_idx": 0, "end_idx": 30},
                                f0_hz=1.0, config=config)
-    assert [peak["peak_idx"] for peak in peaks] == [140]
-    assert peaks[0]["coarse_left_rise"] == 11.0
-    assert len(rois) == 1
+    assert peaks == rois == []
 
     _, shifted_peaks = find_uh_rois(signal + 100.0, fs=100, sigma_uh=1.0,
                                    sigma_duh=1.0,
-                                   motion_interval={"start_idx": 0, "end_idx": 300},
-                                   f0_hz=1.0, config=config)
-    assert [peak["peak_idx"] for peak in shifted_peaks] == [140]
+                                   motion_interval={"start_idx": 0, "end_idx": 30},
+                                   f0_hz=1.0,
+                                   config=ExperimentConfig(uh_peak_prominence_sigma=0.5,
+                                                           uh_peak_to_coarse_mean_sigma=5.0))
+    assert [peak["peak_idx"] for peak in shifted_peaks] == [15]
+    assert shifted_peaks[0]["coarse_mean_rise"] == 6.0
 
     _, stricter_peaks = find_uh_rois(signal, fs=100, sigma_uh=1.0,
                                     sigma_duh=1.0,
-                                    motion_interval={"start_idx": 0, "end_idx": 300},
+                                    motion_interval={"start_idx": 0, "end_idx": 30},
                                     f0_hz=1.0,
-                                    config=ExperimentConfig(uh_peak_prominence_sigma=2.0,
-                                                            uh_peak_to_coarse_l_sigma=12.0))
+                                    config=ExperimentConfig(uh_peak_prominence_sigma=0.5,
+                                                            uh_peak_to_coarse_mean_sigma=6.0))
     assert stricter_peaks == []
 
 
@@ -116,10 +115,10 @@ def test_period_equality_stays_separate_and_overlap_splits_at_valley():
     values = np.zeros(100)
     values[35] = -2
     peaks = [{"peak_idx": idx, "refined_left_idx": left,
-              "refined_right_idx": right, "coarse_left_rise": rise}
+              "refined_right_idx": right, "coarse_mean_rise": rise}
              for idx, left, right, rise in ((10, 8, 23, 5), (20, 15, 45, 6),
                                             (45, 22, 55, 4))]
-    rois = _group_uh_peaks(values, peaks, fs=100, period_fraction=0.5, f0_hz=2)
+    rois = _group_uh_peaks(values, peaks, fs=100, period_fraction=0.75, f0_hz=3)
     assert [roi["peak_indices"] for roi in rois] == [[10, 20], [45]]
     assert rois[0]["right_idx"] == 35
     assert rois[1]["left_idx"] == 36
@@ -141,6 +140,18 @@ def test_median_difference_detects_one_sample_steps_only_inside_roi():
     assert set(("roi_id", "center_idx", "region_start_idx", "region_end_idx",
                 "direction", "detector_score", "detector_name")) <= candidates[0].keys()
     assert 1 in diagnostics["scale_scores"]
+
+
+def test_udeco_detection_extends_only_the_left_side_of_logical_roi():
+    signal = np.zeros(2500)
+    signal[1798:1820] = 0.01
+    roi = {"roi_id": "ROI_0", "left_idx": 1800, "right_idx": 1850,
+           "search_left_idx": 1797}
+    candidates, _ = detect_roi_candidates(signal, [roi], fs=100,
+                                          config=ExperimentConfig())
+    assert any(candidate["direction"] == 1 and candidate["center_idx"] < 1800
+               for candidate in candidates)
+    assert all(1797 <= candidate["center_idx"] <= 1850 for candidate in candidates)
 
 
 def test_haar_switch_uses_same_candidate_contract_and_fixed_baseline_noise():
@@ -191,6 +202,41 @@ def test_localization_separates_one_cycle_step_from_seventy_ms_ramp():
     assert gradual["derivative_peak_width"] >= 0.06
 
 
+def test_localization_can_finish_beyond_logical_roi_right_boundary():
+    signal = np.zeros(2200)
+    signal[1848:1858] = np.arange(1, 11) * 0.001
+    signal[1858:] = 0.01
+    roi = {"roi_id": "ROI_0", "left_idx": 1800,
+           "search_left_idx": 1797, "right_idx": 1850}
+    candidate = {"roi_id": "ROI_0", "center_idx": 1849, "direction": 1,
+                 "region_start_idx": 1849, "region_end_idx": 1849,
+                 "detector_score": 20.0, "detector_name": "median_diff"}
+    measured = localize_roi_candidates(
+        signal, signal, [candidate], [roi], fs=100,
+        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4},
+        config=ExperimentConfig())[0]
+    assert measured["resolved"]
+    assert measured["core_end_idx"] > roi["right_idx"]
+    assert measured["settle_end_idx"] > roi["right_idx"]
+
+
+def test_localization_can_start_before_left_search_boundary():
+    signal = np.zeros(2200)
+    signal[1794:1802] = np.arange(1, 9) * 0.001
+    signal[1802:] = 0.008
+    roi = {"roi_id": "ROI_0", "left_idx": 1800,
+           "search_left_idx": 1797, "right_idx": 1850}
+    candidate = {"roi_id": "ROI_0", "center_idx": 1798, "direction": 1,
+                 "region_start_idx": 1798, "region_end_idx": 1798,
+                 "detector_score": 20.0, "detector_name": "median_diff"}
+    measured = localize_roi_candidates(
+        signal, signal, [candidate], [roi], fs=100,
+        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4},
+        config=ExperimentConfig())[0]
+    assert measured["resolved"]
+    assert measured["start_idx"] < roi["search_left_idx"]
+
+
 def test_fast_step_with_long_tail_stays_sharp():
     signal = np.zeros(2200)
     signal[1800:] = 0.01
@@ -198,32 +244,63 @@ def test_fast_step_with_long_tail_stays_sharp():
     signal[1822:] += 21 * 0.0003
     localized = _localized_synthetic(signal, 1800)
     table = build_event_table(
-        [localized], [{"roi_id": "ROI_0"}], channel="Udeco2",
-        sigma_udeco=1e-4, config=ExperimentConfig(),
+        [localized], [{"roi_id": "ROI_0", "left_idx": 1755,
+                       "main_peak_idx": 1810, "right_idx": 1880}], channel="Udeco2",
+        sigma_udeco=1e-4, fs=100, config=ExperimentConfig(),
         direction_map={1: {"sharp": "detach", "gradual": "release"},
                        -1: {"sharp": "attach", "gradual": "pressure"}})
     assert localized["T_core"] == 0.01
     assert localized["T_tail"] >= 0.10
     assert table.iloc[0]["morphology"] == "sharp_long_tail"
-    assert table.iloc[0]["event_label"] == "detach"
+    assert table.iloc[0]["event_label"] is None
 
 
-def test_roi_selects_only_largest_actual_rise_and_fall():
+def test_roi_requires_left_then_peak_opposite_edges_and_prefers_peak_amplitude():
     base = {"roi_id": "ROI_0", "resolved": True, "T_core": 0.01,
             "T_tail": 0.0, "direction": 1, "derivative_peak": 0.002,
             "normalized_derivative_peak": 20.0, "derivative_peak_width": 0.01,
             "monotonicity": 1.0, "detector_name": "median_diff"}
-    localized = [{**base, "center_idx": 100, "delta": 0.001},
-                 {**base, "center_idx": 110, "delta": 0.01},
-                 {**base, "center_idx": 120, "direction": -1, "delta": -0.008}]
+    localized = [{**base, "center_idx": 105, "start_idx": 105, "delta": 0.01},
+                 {**base, "center_idx": 145, "start_idx": 145, "delta": 0.02},
+                 {**base, "center_idx": 165, "start_idx": 165,
+                  "direction": -1, "delta": -0.008},
+                 {**base, "center_idx": 205, "start_idx": 205,
+                  "direction": -1, "delta": -0.03}]
     table = build_event_table(
-        localized, [{"roi_id": "ROI_0"}], channel="Udeco2",
-        sigma_udeco=1e-4, config=ExperimentConfig(),
+        localized, [{"roi_id": "ROI_0", "left_idx": 100, "search_left_idx": 97,
+                     "main_peak_idx": 160, "right_idx": 220}], channel="Udeco2",
+        sigma_udeco=1e-4, fs=100, config=ExperimentConfig(),
         direction_map={1: {"sharp": "detach", "gradual": "release"},
                        -1: {"sharp": "attach", "gradual": "pressure"}})
-    assert table.loc[table.is_main_rising, "center_idx"].tolist() == [110]
-    assert table.loc[table.is_main_falling, "center_idx"].tolist() == [120]
-    assert table.loc[table.center_idx == 100, "is_main_rising"].item() == False
+    assert table.loc[table.is_main_rising, "center_idx"].tolist() == [145]
+    assert table.loc[table.is_main_falling, "center_idx"].tolist() == [205]
+    assert table.loc[table.center_idx == 165, "is_main_falling"].item() == False
+    assert set(table.loc[table.edge_role.notna(), "edge_role"]) == {"left", "peak"}
+
+
+def test_cross_roi_duplicate_prefers_later_roi_and_missing_pair_stays_unpaired():
+    base = {"resolved": True, "T_core": 0.01, "T_tail": 0.0,
+            "derivative_peak_width": 0.01, "normalized_derivative_peak": 20.0,
+            "detector_name": "median_diff"}
+    localized = [{**base, "roi_id": "ROI_0", "center_idx": 199,
+                  "start_idx": 199, "direction": 1, "delta": 0.01},
+                 {**base, "roi_id": "ROI_1", "center_idx": 199,
+                  "start_idx": 199, "direction": 1, "delta": 0.01},
+                 {**base, "roi_id": "ROI_1", "center_idx": 249,
+                  "start_idx": 249, "direction": -1, "delta": -0.01}]
+    rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200,
+             "main_peak_idx": 150},
+            {"roi_id": "ROI_1", "left_idx": 201, "search_left_idx": 198,
+             "right_idx": 300, "main_peak_idx": 250}]
+    table = build_event_table(
+        localized, rois, channel="Udeco2", sigma_udeco=1e-4,
+        fs=100, config=ExperimentConfig(),
+        direction_map={1: {"sharp": "detach", "gradual": "release"},
+                       -1: {"sharp": "attach", "gradual": "pressure"}})
+    assert table.loc[table.roi_id == "ROI_0", "overlap_duplicate"].item() == True
+    assert table.loc[table.roi_id == "ROI_0", "is_main_rising"].item() == False
+    assert table.loc[table.is_main_rising, "roi_id"].tolist() == ["ROI_1"]
+    assert table.loc[table.is_main_falling, "roi_id"].tolist() == ["ROI_1"]
 
 
 def test_single_slow_uh_peak_uses_refined_bounds_without_margin():

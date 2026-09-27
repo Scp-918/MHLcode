@@ -27,8 +27,8 @@ class ExperimentConfig:
     context_robust_iters: int = 1
     baseline_sec: float = 15.0
     uh_peak_prominence_sigma: float = 4.0
-    uh_peak_to_coarse_l_sigma: float = 10.0
-    uh_peak_period_fraction: float = 0.5
+    uh_peak_to_coarse_mean_sigma: float = 10.0
+    uh_peak_period_fraction: float = 0.75
     uh_flat_slope_sigma: float = 2.0
     uh_flat_min_sec: float = 0.05
     fft_min_hz: float = 0.5
@@ -190,7 +190,7 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
     """Find motion-only positive peaks and build period-aware, disjoint ROIs."""
     values = np.asarray(edge_signal, dtype=float)
     prominence = config.uh_peak_prominence_sigma * sigma_uh
-    coarse_left_rise_threshold = config.uh_peak_to_coarse_l_sigma * sigma_uh
+    coarse_mean_rise_threshold = config.uh_peak_to_coarse_mean_sigma * sigma_uh
     if f0_hz <= 0:
         raise ValueError("f0_hz must be positive")
     motion_start = motion_interval["start_idx"]
@@ -201,14 +201,16 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
     for position, local_peak_idx in enumerate(indices):
         peak_idx = int(local_peak_idx + motion_start)
         coarse_left_idx = int(props["left_bases"][position] + motion_start)
-        coarse_left_rise = float(values[peak_idx] - values[coarse_left_idx])
-        if coarse_left_rise <= coarse_left_rise_threshold:
+        coarse_right_idx = int(props["right_bases"][position] + motion_start)
+        coarse_mean_rise = float(values[peak_idx] -
+                                 (values[coarse_left_idx] + values[coarse_right_idx]) / 2)
+        if coarse_mean_rise <= coarse_mean_rise_threshold:
             continue
         peaks.append({"peak_idx": int(peak_idx), "sign": 1,
                       "prominence": float(props["prominences"][position]),
-                      "coarse_left_rise": coarse_left_rise,
+                      "coarse_mean_rise": coarse_mean_rise,
                       "coarse_left_idx": coarse_left_idx,
-                      "coarse_right_idx": int(props["right_bases"][position] + motion_start),
+                      "coarse_right_idx": coarse_right_idx,
                       "plateau_left_idx": int(props["left_edges"][position] + motion_start),
                       "plateau_right_idx": int(props["right_edges"][position] + motion_start)})
     peaks.sort(key=lambda row: row["peak_idx"])
@@ -230,6 +232,9 @@ def find_uh_rois(edge_signal: np.ndarray, *, fs: float, sigma_uh: float,
             config.uh_peak_prominence_sigma * sigma_uh)
     rois = _group_uh_peaks(values, peaks, fs=fs, period_fraction=config.uh_peak_period_fraction,
                            f0_hz=f0_hz)
+    lead_points = round(config.udeco_left_lead_sec * fs)
+    for roi in rois:
+        roi["search_left_idx"] = max(0, roi["left_idx"] - lead_points)
     return rois, peaks
 
 
@@ -245,7 +250,7 @@ def _group_uh_peaks(values: np.ndarray, peaks: list[dict], *, fs: float,
             groups.append([peak])
     rois = []
     for group in groups:
-        main_peak = max(group, key=lambda item: item["coarse_left_rise"])
+        main_peak = max(group, key=lambda item: item["coarse_mean_rise"])
         rois.append({"roi_id": f"ROI_{len(rois)}",
                      "left_idx": min(item["refined_left_idx"] for item in group),
                      "right_idx": max(item["refined_right_idx"] for item in group),
@@ -297,7 +302,7 @@ def _best_signed_score(scale_scores: dict, n: int) -> np.ndarray:
 
 def _score_regions(score: np.ndarray, roi: dict, threshold: float,
                    merge_points: int) -> list[np.ndarray]:
-    lo, hi = roi["left_idx"], roi["right_idx"]
+    lo, hi = roi.get("search_left_idx", roi["left_idx"]), roi["right_idx"]
     active = np.arange(lo, hi + 1)
     active = active[np.abs(score[active]) >= threshold]
     if not len(active):
@@ -426,25 +431,32 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
     edge_signal = np.asarray(edge_signal, dtype=float)
     derivative = np.diff(edge_signal)
     roi_by_id = {roi["roi_id"]: roi for roi in rois}
+    radius = max(1, round(config.localize_search_sec * fs))
+    pre_points = max(1, round(config.pre_plateau_sec * fs))
+    post_points = max(1, round(config.post_plateau_sec * fs))
+    settle_points = max(1, round(config.settle_window_sec * fs))
+    hold_points = max(1, round(config.settle_hold_sec * fs))
     neighbor_bounds = {}
     for roi_id in roi_by_id:
         ordered = sorted((i for i, row in enumerate(candidates) if row["roi_id"] == roi_id),
                          key=lambda i: candidates[i]["center_idx"])
         for position, i in enumerate(ordered):
             center = int(candidates[i]["center_idx"])
-            left = (int(candidates[ordered[position-1]]["center_idx"]) + center) // 2 if position else roi_by_id[roi_id]["left_idx"]
-            right = (center + int(candidates[ordered[position+1]]["center_idx"])) // 2 if position + 1 < len(ordered) else roi_by_id[roi_id]["right_idx"]
+            left = ((int(candidates[ordered[position-1]]["center_idx"]) + center) // 2
+                    if position else max(0, roi_by_id[roi_id].get("search_left_idx", roi_by_id[roi_id]["left_idx"])
+                                         - radius - pre_points))
+            right = ((center + int(candidates[ordered[position+1]]["center_idx"])) // 2
+                     if position + 1 < len(ordered) else
+                     min(len(clean) - 1, roi_by_id[roi_id]["right_idx"] + radius
+                         + settle_points + hold_points + post_points))
             neighbor_bounds[i] = (left, right)
-    radius = max(1, round(config.localize_search_sec * fs))
-    pre_points = max(1, round(config.pre_plateau_sec * fs))
-    post_points = max(1, round(config.post_plateau_sec * fs))
-    settle_points = max(1, round(config.settle_window_sec * fs))
-    hold_points = max(1, round(config.settle_hold_sec * fs))
     result = []
     for candidate_index, candidate in enumerate(candidates):
         roi = roi_by_id[candidate["roi_id"]]
-        left, right = int(roi["left_idx"]), int(roi["right_idx"])
         search_left, search_right = neighbor_bounds[candidate_index]
+        left = max(0, roi.get("search_left_idx", roi["left_idx"]) - radius - pre_points)
+        right = min(len(clean) - 1, roi["right_idx"] + radius
+                    + settle_points + hold_points + post_points)
         center = int(candidate["center_idx"])
         direction = int(candidate["direction"])
         lo = max(search_left, center - radius - 1)
@@ -477,7 +489,7 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
         if core_end_idx is None:
             result.append(_unresolved(candidate, "core_does_not_end", **partial))
             continue
-        if start_idx - pre_points + 1 < left:
+        if start_idx - pre_points + 1 < 0:
             result.append(_unresolved(candidate, "missing_pre_plateau", **partial))
             continue
         pre_values = clean[start_idx-pre_points+1:start_idx+1]
@@ -502,7 +514,7 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                 stable_run = 0
                 stable_start = None
         if settle_end_idx is None:
-            result.append(_unresolved(candidate, "not_settled_in_roi", **partial))
+            result.append(_unresolved(candidate, "not_settled_in_search_window", **partial))
             continue
         partial["settle_end_idx"] = settle_end_idx
         if settle_end_idx + post_points > right:
@@ -537,13 +549,15 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
 
 
 def build_event_table(localized: list[dict], rois: list[dict], *, channel: str,
-                      sigma_udeco: float, config: ExperimentConfig,
+                      sigma_udeco: float, fs: float, config: ExperimentConfig,
                       direction_map: dict[int, dict[str, str]]) -> pd.DataFrame:
-    """Keep all candidates but designate only the largest rise/fall per ROI."""
+    """Retain every candidate and select one ordered left/peak edge pair per ROI."""
     rows = []
     for item in localized:
         row = {**item, "channel": channel, "is_main_rising": False,
-               "is_main_falling": False, "morphology": None, "event_label": None}
+               "is_main_falling": False, "morphology": None, "event_label": None,
+               "edge_role": None, "pair_status": "missing_pair",
+               "overlap_duplicate": False, "duplicate_owner_roi_id": None}
         if item.get("resolved"):
             shape = "sharp" if item["T_core"] <= config.sharp_core_duration_sec else "gradual"
             row["morphology"] = ("sharp_long_tail" if shape == "sharp"
@@ -555,17 +569,50 @@ def build_event_table(localized: list[dict], rois: list[dict], *, channel: str,
     if table.empty:
         return pd.DataFrame(columns=["channel", "roi_id", "center_idx", "direction", "delta",
                                      "resolved", "is_main_rising", "is_main_falling",
-                                     "morphology", "event_label"])
+                                     "morphology", "event_label", "edge_role", "pair_status",
+                                     "overlap_duplicate"])
+    table["edge_position_idx"] = (table["start_idx"].fillna(table["center_idx"])
+                                  if "start_idx" in table else table["center_idx"])
+    duplicate_points = round(config.candidate_merge_sec * fs)
+    for earlier, later in zip(rois, rois[1:]):
+        later_search_left = later.get("search_left_idx", later["left_idx"])
+        earlier_rows = table.loc[(table.roi_id == earlier["roi_id"])
+                                 & (table.center_idx >= later_search_left)]
+        later_rows = table.loc[table.roi_id == later["roi_id"]]
+        for index, row in earlier_rows.iterrows():
+            matching = later_rows.loc[(later_rows.direction == row.direction)
+                                      & ((later_rows.center_idx - row.center_idx).abs()
+                                         <= duplicate_points)]
+            if not matching.empty:
+                table.at[index, "overlap_duplicate"] = True
+                table.at[index, "duplicate_owner_roi_id"] = later["roi_id"]
     for roi in rois:
-        for direction, column in ((1, "is_main_rising"), (-1, "is_main_falling")):
-            eligible = table.loc[(table.roi_id == roi["roi_id"])
-                                 & (table.resolved == True)
-                                 & (table.direction == direction)
-                                 & (direction * table.delta >= config.min_amplitude_sigma_k * sigma_udeco)]
-            if eligible.empty:
+        eligible = table.loc[(table.roi_id == roi["roi_id"])
+                             & (table.resolved == True)
+                             & (table.overlap_duplicate == False)
+                             & (table.direction * table.delta
+                                >= config.min_amplitude_sigma_k * sigma_udeco)]
+        left = roi["left_idx"]
+        peak = roi["main_peak_idx"]
+        right = roi["right_idx"]
+        peak_zone = eligible.loc[(eligible.center_idx >= (left + peak) // 2)
+                                 & (eligible.center_idx <= right)]
+        peak_zone = peak_zone.reindex(peak_zone.delta.abs().sort_values(ascending=False).index)
+        for peak_index, peak_edge in peak_zone.iterrows():
+            left_zone = eligible.loc[(eligible.center_idx
+                                      >= roi.get("search_left_idx", left))
+                                     & (eligible.center_idx <= peak)
+                                     & (eligible.center_idx < peak_edge.center_idx)
+                                     & (eligible.direction == -peak_edge.direction)]
+            if left_zone.empty:
                 continue
-            selected = eligible.delta.abs().idxmax()
-            table.at[selected, column] = True
-            shape = "sharp" if table.at[selected, "T_core"] <= config.sharp_core_duration_sec else "gradual"
-            table.at[selected, "event_label"] = direction_map[direction][shape]
+            left_index = left_zone.delta.abs().idxmax()
+            for index, role in ((left_index, "left"), (peak_index, "peak")):
+                direction = int(table.at[index, "direction"])
+                table.at[index, "is_main_rising" if direction > 0 else "is_main_falling"] = True
+                table.at[index, "edge_role"] = role
+                shape = "sharp" if table.at[index, "T_core"] <= config.sharp_core_duration_sec else "gradual"
+                table.at[index, "event_label"] = direction_map[direction][shape]
+            table.loc[table.roi_id == roi["roi_id"], "pair_status"] = "paired"
+            break
     return table
