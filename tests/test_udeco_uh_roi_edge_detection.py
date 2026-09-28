@@ -157,6 +157,45 @@ def test_udeco_detection_extends_only_the_left_side_of_logical_roi():
     assert all(1797 <= candidate["center_idx"] <= 1850 for candidate in candidates)
 
 
+def test_derivative_extrema_selects_one_signed_boundary_per_roi():
+    rng = np.random.default_rng(23)
+    signal = np.zeros(2500)
+    signal[:1500] = rng.normal(0, 1e-4, 1500)
+    signal[1798:1820] = 0.01
+    signal[1851:] = 0.05  # Larger edge just outside the ROI must be ignored.
+    roi = {"roi_id": "ROI_0", "left_idx": 1800, "search_left_idx": 1797,
+           "right_idx": 1850}
+
+    candidates, diagnostics = detect_roi_candidates(
+        signal, [roi], fs=100,
+        config=ExperimentConfig(edge_detector="derivative_extrema"))
+
+    assert [(row["center_idx"], row["direction"]) for row in candidates] == [
+        (1798, 1), (1820, -1)]
+    assert all(row["region_start_idx"] == row["center_idx"] == row["region_end_idx"]
+               for row in candidates)
+    assert all(row["detector_name"] == "derivative_extrema" for row in candidates)
+    sigma_du = np.std(np.diff(signal[:1500]))
+    assert np.isclose(diagnostics["derivative_sigma"], sigma_du)
+    assert np.isclose(candidates[0]["detector_score"], 0.01 / sigma_du)
+
+
+def test_derivative_extrema_keeps_only_available_direction_without_score_gate():
+    rng = np.random.default_rng(24)
+    signal = np.zeros(2500)
+    signal[:1500] = rng.normal(0, 1e-4, 1500)
+    signal[1800:1860] = np.arange(60) * 1e-5
+    roi = {"roi_id": "ROI_0", "left_idx": 1801, "right_idx": 1850}
+
+    candidates, _ = detect_roi_candidates(
+        signal, [roi], fs=100,
+        config=ExperimentConfig(edge_detector="derivative_extrema"))
+
+    assert len(candidates) == 1
+    assert candidates[0]["direction"] == 1
+    assert candidates[0]["detector_score"] < 3.0
+
+
 def test_haar_switch_uses_same_candidate_contract_and_fixed_baseline_noise():
     rng = np.random.default_rng(13)
     signal = rng.normal(0, 1e-4, 2500)

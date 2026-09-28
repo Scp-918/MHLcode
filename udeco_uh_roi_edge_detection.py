@@ -383,6 +383,24 @@ def _haar_candidates(values: np.ndarray, scores: dict, combined: np.ndarray,
              "fragment_centers": row["fragment_centers"]} for row in merged]
 
 
+def _derivative_extrema_candidates(score: np.ndarray, roi: dict) -> list[dict]:
+    """Return the strongest signed sample difference of each polarity in one ROI."""
+    lo = roi.get("search_left_idx", roi["left_idx"])
+    hi = roi["right_idx"]
+    segment = score[lo:hi+1]
+    candidates = []
+    for direction in (1, -1):
+        center = lo + int(np.argmax(direction * segment))
+        if direction * score[center] <= 0:
+            continue
+        candidates.append({"roi_id": roi["roi_id"], "center_idx": center,
+                           "region_start_idx": center, "region_end_idx": center,
+                           "direction": direction,
+                           "detector_score": float(abs(score[center])),
+                           "detector_name": "derivative_extrema"})
+    return candidates
+
+
 def detect_roi_candidates(edge_signal: np.ndarray, rois: list[dict], *, fs: float,
                           config: ExperimentConfig) -> tuple[list[dict], dict]:
     """Find candidates within Uh ROIs, normalized only by first-15-s noise."""
@@ -390,6 +408,16 @@ def detect_roi_candidates(edge_signal: np.ndarray, rois: list[dict], *, fs: floa
     baseline_n = round(config.baseline_sec * fs)
     if len(values) < baseline_n or baseline_n < 3:
         raise ValueError("recording must contain the complete baseline interval")
+    if config.edge_detector == "derivative_extrema":
+        derivative = np.zeros(len(values), dtype=float)
+        derivative[1:] = np.diff(values)
+        sigma_du = float(np.std(np.diff(values[:baseline_n])))
+        score = derivative / max(sigma_du, np.finfo(float).eps)
+        candidates = [candidate for roi in rois
+                      for candidate in _derivative_extrema_candidates(score, roi)]
+        diagnostics = {"derivative_signal": derivative, "derivative_score": score,
+                       "derivative_sigma": sigma_du, "detector_name": config.edge_detector}
+        return sorted(candidates, key=lambda item: (item["roi_id"], item["center_idx"])), diagnostics
     if config.edge_detector == "median_diff":
         widths = [(int(width), int(width)) for width in config.median_diff_windows]
     elif config.edge_detector == "haar":
