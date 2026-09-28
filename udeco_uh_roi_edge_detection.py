@@ -27,7 +27,7 @@ class ExperimentConfig:
     context_robust_iters: int = 1
     baseline_sec: float = 15.0
     uh_peak_prominence_sigma: float = 4.0
-    uh_peak_to_coarse_mean_sigma: float = 10.0
+    uh_peak_to_coarse_mean_sigma: float = 20.0
     uh_peak_period_fraction: float = 0.75
     uh_flat_slope_sigma: float = 2.0
     uh_flat_min_sec: float = 0.05
@@ -52,7 +52,7 @@ class ExperimentConfig:
     deriv_peak_width_threshold_sec: float = 0.04
     deriv_peak_sigma_k: float = 5.0
     long_tail_sec: float = 0.10
-    min_amplitude_sigma_k: float = 3.0
+    min_amplitude_sigma_k: float = 2.0
     haar_scales_sec: tuple[float, ...] = (0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56)
     haar_single_scale_sigma: float = 3.5
     haar_derivative_sigma: float = 3.5
@@ -643,4 +643,54 @@ def build_event_table(localized: list[dict], rois: list[dict], *, channel: str,
                 table.at[index, "event_label"] = direction_map[direction][shape]
             table.loc[table.roi_id == roi["roi_id"], "pair_status"] = "paired"
             break
+    return table
+
+
+def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel: str,
+                             sigma_udeco: float, fs: float, config: ExperimentConfig,
+                             direction_map: dict[int, dict[str, str]]) -> pd.DataFrame:
+    """Keep detected edges without Uh position-pair filtering."""
+    directions = {roi["roi_id"]: set() for roi in rois}
+    for item in localized:
+        directions[item["roi_id"]].add(item["direction"])
+    rows = []
+    for item in localized:
+        direction = int(item["direction"])
+        resolved = bool(item["resolved"])
+        amplitude_pass = resolved and abs(item["delta"]) > config.min_amplitude_sigma_k * sigma_udeco
+        shape = ("sharp" if item["T_core"] <= config.sharp_core_duration_sec else "gradual") if amplitude_pass else None
+        morphology = ("sharp_long_tail" if shape == "sharp" and item["T_tail"] >= config.long_tail_sec
+                      else shape)
+        rows.append({**item, "channel": channel,
+                     "is_main_rising": direction > 0, "is_main_falling": direction < 0,
+                     "edge_role": "roi_rising" if direction > 0 else "roi_falling",
+                     "pair_status": ("both_detected" if directions[item["roi_id"]] == {1, -1}
+                                     else "missing_direction"),
+                     "amplitude_pass": bool(amplitude_pass),
+                     "classification_status": ("classified" if amplitude_pass else
+                                               "low_amplitude" if resolved else "localization_failed"),
+                     "direction_delta_conflict": bool(resolved and direction * item["delta"] < 0),
+                     "morphology": morphology,
+                     "event_label": direction_map[direction][shape] if amplitude_pass else None,
+                     "derivative_support": (item["derivative_peak_width"] <= config.deriv_peak_width_threshold_sec
+                                            and item["normalized_derivative_peak"] >= config.deriv_peak_sigma_k)
+                                            if resolved else None,
+                     "overlap_duplicate": False, "duplicate_owner_roi_id": None})
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return pd.DataFrame(columns=["channel", "roi_id", "center_idx", "direction",
+                                     "resolved", "is_main_rising", "is_main_falling",
+                                     "classification_status", "direction_delta_conflict"])
+    for earlier, later in zip(rois, rois[1:]):
+        later_left = later.get("search_left_idx", later["left_idx"])
+        earlier_rows = table.loc[(table.roi_id == earlier["roi_id"])
+                                 & (table.center_idx >= later_left)]
+        later_rows = table.loc[table.roi_id == later["roi_id"]]
+        for index, row in earlier_rows.iterrows():
+            duplicate = later_rows.loc[(later_rows.direction == row.direction)
+                                       & ((later_rows.center_idx - row.center_idx).abs()
+                                          <= round(config.candidate_merge_sec * fs))]
+            if not duplicate.empty:
+                table.at[index, "overlap_duplicate"] = True
+                table.at[index, "duplicate_owner_roi_id"] = later["roi_id"]
     return table

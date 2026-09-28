@@ -7,6 +7,7 @@ import numpy as np
 from udeco_uh_roi_edge_detection import (
     ExperimentConfig,
     baseline_sigmas,
+    build_direct_event_table,
     build_event_table,
     detect_roi_candidates,
     find_uh_rois,
@@ -343,6 +344,63 @@ def test_cross_roi_duplicate_prefers_later_roi_and_missing_pair_stays_unpaired()
     assert table.loc[table.roi_id == "ROI_0", "is_main_rising"].item() == False
     assert table.loc[table.is_main_rising, "roi_id"].tolist() == ["ROI_1"]
     assert table.loc[table.is_main_falling, "roi_id"].tolist() == ["ROI_1"]
+
+
+def _direct_edge(roi_id, center, direction, *, delta=None, resolved=True):
+    row = {"roi_id": roi_id, "center_idx": center, "direction": direction,
+           "region_start_idx": center, "region_end_idx": center,
+           "detector_name": "derivative_extrema", "detector_score": 8.0,
+           "resolved": resolved, "reason": None if resolved else "unstable_post_plateau"}
+    if resolved:
+        row.update(start_idx=center - 1, core_end_idx=center,
+                   settle_end_idx=center + 1, delta=delta, T_core=0.01, T_tail=0.01,
+                   derivative_peak_width=0.01, normalized_derivative_peak=8.0)
+    return row
+
+
+def _direct_table(localized, rois):
+    return build_direct_event_table(
+        localized, rois, channel="Udeco2", sigma_udeco=1e-4, fs=100,
+        config=ExperimentConfig(),
+        direction_map={1: {"sharp": "detach", "gradual": "release"},
+                       -1: {"sharp": "attach", "gradual": "pressure"}})
+
+
+def test_direct_selection_displays_both_extrema_without_position_pair_gate():
+    rois = [{"roi_id": "ROI_0", "left_idx": 100, "search_left_idx": 97,
+             "main_peak_idx": 160, "right_idx": 220}]
+    table = _direct_table([
+        _direct_edge("ROI_0", 105, 1, delta=0.01),
+        _direct_edge("ROI_0", 180, -1, resolved=False)], rois)
+    assert table.is_main_rising.tolist() == [True, False]
+    assert table.is_main_falling.tolist() == [False, True]
+    assert table.pair_status.tolist() == ["both_detected", "both_detected"]
+    assert table.event_label.tolist() == ["detach", None]
+    assert table.classification_status.tolist() == ["classified", "localization_failed"]
+
+
+def test_direct_classification_uses_strict_absolute_delta_and_flags_sign_conflict():
+    rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200},
+            {"roi_id": "ROI_1", "left_idx": 201, "right_idx": 300}]
+    table = _direct_table([
+        _direct_edge("ROI_0", 150, 1, delta=0.0002),
+        _direct_edge("ROI_1", 250, 1, delta=-0.0003)], rois)
+    assert table.pair_status.tolist() == ["missing_direction", "missing_direction"]
+    assert table.event_label.tolist() == [None, "detach"]
+    assert table.classification_status.tolist() == ["low_amplitude", "classified"]
+    assert table.direction_delta_conflict.tolist() == [False, True]
+
+
+def test_direct_cross_roi_duplicate_is_diagnostic_only():
+    rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200},
+            {"roi_id": "ROI_1", "left_idx": 201, "search_left_idx": 198,
+             "right_idx": 300}]
+    table = _direct_table([
+        _direct_edge("ROI_0", 199, 1, delta=0.01),
+        _direct_edge("ROI_1", 199, 1, delta=0.01)], rois)
+    assert table.overlap_duplicate.tolist() == [True, False]
+    assert table.is_main_rising.tolist() == [True, True]
+    assert table.event_label.tolist() == ["detach", "detach"]
 
 
 def test_single_slow_uh_peak_uses_refined_bounds_without_margin():
