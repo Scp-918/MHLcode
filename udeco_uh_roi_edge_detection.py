@@ -42,6 +42,10 @@ class ExperimentConfig:
     extrema_trace_sec: float = 1.0
     threshold_dupeak: float = 0.15
     threshold_du: float = 2.0
+    threshold_du_left: float = 2.0
+    threshold_dupeak_left: float = 0.15
+    threshold_du_right: float = 2.0
+    threshold_dupeak_right: float = 0.08
     core_end_min_points: int = 2
     sharp_edge_duration_sec: float = 0.05
     deriv_peak_width_threshold_sec: float = 0.04
@@ -501,30 +505,57 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                                       derivative_peak_idx=peak_k + 1,
                                       derivative_peak=peak))
             continue
-        core_threshold = max(config.threshold_du * noise["sigma_du"],
-                             config.threshold_dupeak * abs(peak))
+        extrema = candidate["detector_name"] == "derivative_extrema"
+        threshold_left = max((config.threshold_du_left if extrema else config.threshold_du) * noise["sigma_du"],
+                             (config.threshold_dupeak_left if extrema else config.threshold_dupeak) * abs(peak))
+        threshold_right = max((config.threshold_du_right if extrema else config.threshold_du) * noise["sigma_du"],
+                              (config.threshold_dupeak_right if extrema else config.threshold_dupeak) * abs(peak))
+        core_threshold = threshold_left
         start_idx = None
+        end_idx = None
+        start_rule = None
+        end_rule = None
+        if (extrema and peak_k >= left + 2 and peak_k + 2 < right
+                and 0 < direction * derivative[peak_k - 1] < threshold_left
+                and 0 < direction * derivative[peak_k - 2] < threshold_left
+                and abs(derivative[peak_k + 1]) < threshold_right
+                and abs(derivative[peak_k + 2]) < threshold_right):
+            start_idx, end_idx = peak_k - 2, peak_k + 1
+            start_rule = end_rule = "single_point"
         low_run = 0
-        for k in range(peak_k - 1, left - 1, -1):
-            low_run = low_run + 1 if abs(derivative[k]) < core_threshold else 0
-            if low_run >= config.core_end_min_points:
-                start_idx = k + low_run
-                break
+        if start_idx is None:
+            for k in range(peak_k - 1, left - 1, -1):
+                if extrema and direction * derivative[k] < 0:
+                    start_idx, start_rule = k + 1, "reversal"
+                    break
+                low_run = low_run + 1 if abs(derivative[k]) < threshold_left else 0
+                if low_run >= config.core_end_min_points:
+                    start_idx, start_rule = k + low_run, "threshold"
+                    break
         if start_idx is None:
             result.append(_unresolved(candidate, "core_does_not_start",
                                       derivative_peak_idx=peak_k + 1,
-                                      derivative_peak=peak, core_threshold=core_threshold))
+                                      derivative_peak=peak, core_threshold=core_threshold,
+                                      threshold_left=threshold_left, threshold_right=threshold_right))
             continue
-        end_idx = None
         low_run = 0
-        for k in range(peak_k + 1, right):
-            low_run = low_run + 1 if abs(derivative[k]) < core_threshold else 0
-            if low_run >= config.core_end_min_points:
-                end_idx = k - low_run + 1
-                break
+        reverse_count = 0
+        if end_idx is None:
+            for k in range(peak_k + 1, right):
+                if extrema and direction * derivative[k] < 0:
+                    reverse_count += 1
+                    if reverse_count >= 2:
+                        end_idx, end_rule = k, "second_reversal"
+                        break
+                low_run = low_run + 1 if abs(derivative[k]) < threshold_right else 0
+                if low_run >= config.core_end_min_points:
+                    end_idx, end_rule = k - low_run + 1, "threshold"
+                    break
         partial = {"start_idx": start_idx, "end_idx": end_idx,
                    "derivative_peak_idx": peak_k + 1, "derivative_peak": peak,
-                   "core_threshold": core_threshold}
+                   "core_threshold": core_threshold,
+                   "threshold_left": threshold_left, "threshold_right": threshold_right,
+                   "start_rule": start_rule, "end_rule": end_rule}
         if end_idx is None:
             result.append(_unresolved(candidate, "core_does_not_end", **partial))
             continue
@@ -577,8 +608,12 @@ def _split_extrema_overlaps(rows, edge_signal, *, fs, noise, config):
         split = lo + int(np.argmin(np.abs(derivative[lo:hi])))
         for row in (first, second):
             row["overlap_split_idx"] = split
-        first["end_idx"] = min(end, split)
-        second["start_idx"] = max(start, split + 1)
+        if split < end:
+            first["end_idx"] = split
+            first["end_rule"] = "overlap_split"
+        if split + 1 > start:
+            second["start_idx"] = split + 1
+            second["start_rule"] = "overlap_split"
         changed.update(pair)
     for i in changed:
         row = rows[i]
@@ -628,7 +663,8 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
             continue
         left = roi.get("search_left_idx", roi["left_idx"])
         right = roi["right_idx"]
-        peak = left + int(np.argmax(np.abs(values[left:right + 1])))
+        segment = values[left:right + 1]
+        peak = left + int(np.argmax(np.abs(segment - np.mean(segment))))
         limits = (max(0, peak - reach), min(len(values) - 1, peak + reach))
         for side, step, limit in (("left", -1, limits[0]), ("right", 1, limits[1])):
             bound, source = _fallback_boundary(values, peak, limit, step)

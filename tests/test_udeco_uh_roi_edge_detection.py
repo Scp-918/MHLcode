@@ -483,6 +483,8 @@ def test_overlapping_extrema_split_at_quietest_derivative_and_remeasure():
     first, second = rows
     assert first["overlap_split_idx"] == second["overlap_split_idx"] == 21
     assert first["end_idx"] < second["start_idx"]
+    assert first["end_rule"] == "overlap_split"
+    assert second["start_idx"] == 35
     assert first["T_edge"] == .02
     assert first["delta"] == 1
     assert np.isclose(second["delta"], -.8)
@@ -530,7 +532,7 @@ def test_left_start_requires_two_quiet_differences_and_threshold_override():
     signal[1800:] += .01
     roi = {"roi_id": "ROI_0", "left_idx": 1790, "right_idx": 1820}
     candidate = {"roi_id": "ROI_0", "center_idx": 1800, "direction": 1,
-                 "detector_name": "derivative_extrema"}
+                 "detector_name": "median_diff"}
     cfg = ExperimentConfig(threshold_du=2, threshold_dupeak=.15)
     row = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
                                   noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=cfg)[0]
@@ -551,7 +553,7 @@ def test_peak_fallback_positive_and_negative_turn_beyond_roi():
     positive[20:30] = np.arange(1, 11) * .01
     positive[30:40] = np.arange(9, -1, -1) * .01
     positive[40] = .02
-    roi = {"roi_id": "ROI_0", "left_idx": 23, "search_left_idx": 22,
+    roi = {"roi_id": "ROI_0", "left_idx": 23, "search_left_idx": 0,
            "right_idx": 35}
     noise = {"sigma_udeco": 1e-4, "sigma_du": 1e-4}
     for signal, directions in ((positive, (1, -1)), (-positive, (-1, 1))):
@@ -561,7 +563,7 @@ def test_peak_fallback_positive_and_negative_turn_beyond_roi():
         assert [row["direction"] for row in rows] == list(directions)
         assert [(row["start_idx"], row["end_idx"]) for row in rows] == [(19, 29), (29, 39)]
         assert all(row["endpoint_source"] == "turn" for row in rows)
-        assert rows[0]["start_idx"] < roi["search_left_idx"]
+        assert rows[0]["start_idx"] < roi["left_idx"]
         assert rows[1]["end_idx"] > roi["right_idx"]
 
 
@@ -570,7 +572,7 @@ def test_fallback_search_limit_and_main_pair_switch():
     signal = np.zeros(100)
     signal[20:31] = np.arange(1, 12) * .01
     signal[31:] = signal[30]
-    roi = {"roi_id": "ROI_0", "left_idx": 24, "search_left_idx": 22,
+    roi = {"roi_id": "ROI_0", "left_idx": 24, "search_left_idx": 0,
            "right_idx": 33}
     noise = {"sigma_udeco": 1e-4, "sigma_du": 1e-4}
     rows = recover_missing_extrema_pairs(signal, [], [roi], fs=100,
@@ -595,3 +597,83 @@ def test_fallback_search_limit_and_main_pair_switch():
                 _direct_edge("ROI_0", 32, -1, delta=-.01)]
     assert len(recover_missing_extrema_pairs(positive, complete, [roi], fs=100,
                                              noise=noise, config=ExperimentConfig())) == 2
+
+
+def _extrema_from_steps(steps, peak_k=10, config=None, direction=1):
+    signal = np.r_[0.0, np.cumsum(steps)]
+    roi = {"roi_id": "ROI_0", "left_idx": 1, "right_idx": len(signal)-2}
+    candidate = {"roi_id": "ROI_0", "center_idx": peak_k+1, "direction": direction,
+                 "detector_name": "derivative_extrema"}
+    return localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
+                                   noise={"sigma_udeco": .01, "sigma_du": .01},
+                                   config=config or ExperimentConfig())[0]
+
+
+def test_extrema_left_reversal_and_second_right_reverse_sample():
+    steps = np.zeros(30)
+    steps[8:15] = [-.04, .05, .2, .04, -.03, .04, -.03]
+    row = _extrema_from_steps(steps)
+    assert row["resolved"]
+    assert row["start_idx"] == 9
+    assert row["end_idx"] == 14
+    assert row["start_rule"] == "reversal"
+    assert row["end_rule"] == "second_reversal"
+    assert np.isclose(row["threshold_left"], .03)
+    assert np.isclose(row["threshold_right"], .02)
+    steps[13] = -.03
+    row = _extrema_from_steps(steps)
+    assert row["end_idx"] == 13
+
+
+def test_extrema_single_point_includes_two_same_sign_steps():
+    steps = np.zeros(30)
+    steps[8:13] = [.01, .01, .2, .005, .005]
+    row = _extrema_from_steps(steps)
+    assert row["resolved"]
+    assert (row["start_idx"], row["end_idx"]) == (8, 11)
+    assert row["start_rule"] == row["end_rule"] == "single_point"
+    negative = _extrema_from_steps(-steps, direction=-1)
+    assert (negative["start_idx"], negative["end_idx"]) == (8, 11)
+    assert negative["start_rule"] == "single_point"
+    steps[8] = -.01
+    ordinary = _extrema_from_steps(steps)
+    assert ordinary["start_rule"] != "single_point"
+    steps[8] = .01
+    steps[12] = .03
+    continued = _extrema_from_steps(steps)
+    assert continued["start_rule"] != "single_point"
+
+
+def test_peak_fallback_selects_mean_centered_extreme():
+    from udeco_uh_roi_edge_detection import recover_missing_extrema_pairs
+    values = np.array([1.0, 1.0, 1.01, 1.04, 1.1, 1.04, 1.01, 1.0, 1.0])
+    roi = {"roi_id": "ROI_0", "left_idx": 0, "right_idx": 8}
+    noise = {"sigma_udeco": .001, "sigma_du": .001}
+    for offset in (0, 5):
+        rows = recover_missing_extrema_pairs(values + offset, [], [roi], fs=100,
+                                              noise=noise, config=ExperimentConfig())
+        assert {row["fallback_peak_idx"] for row in rows} == {4}
+
+
+def test_extrema_asymmetric_override_does_not_change_other_detector():
+    steps = np.zeros(30)
+    steps[8:13] = [.04, .04, .2, .025, .025]
+    default = _extrema_from_steps(steps)
+    override = ExperimentConfig(threshold_du_left=5, threshold_dupeak_left=.01,
+                                threshold_du_right=4, threshold_dupeak_right=.01)
+    changed = _extrema_from_steps(steps, config=override)
+    assert np.isclose(default["threshold_left"], .03)
+    assert np.isclose(default["threshold_right"], .02)
+    assert np.isclose(changed["threshold_left"], .05)
+    assert np.isclose(changed["threshold_right"], .04)
+    signal = np.r_[0.0, np.cumsum(steps)]
+    roi = {"roi_id": "ROI_0", "left_idx": 1, "right_idx": len(signal)-2}
+    candidate = {"roi_id": "ROI_0", "center_idx": 11, "direction": 1,
+                 "detector_name": "haar"}
+    noise = {"sigma_udeco": .01, "sigma_du": .01}
+    original = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
+                                       noise=noise, config=ExperimentConfig())[0]
+    retained = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
+                                       noise=noise, config=override)[0]
+    assert (original["start_idx"], original["end_idx"]) == (retained["start_idx"], retained["end_idx"])
+    assert original["threshold_left"] == retained["threshold_left"]
