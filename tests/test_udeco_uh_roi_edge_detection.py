@@ -8,7 +8,6 @@ from udeco_uh_roi_edge_detection import (
     ExperimentConfig,
     baseline_sigmas,
     build_direct_event_table,
-    build_event_table,
     detect_roi_candidates,
     find_uh_rois,
     estimate_motion_frequency,
@@ -129,23 +128,6 @@ def test_main_peak_distance_equality_and_long_gap():
     assert [roi["main_peak_idx"] for roi in rois if roi["main_peak_idx"] < 200] == [174]
 
 
-def test_median_difference_detects_one_sample_steps_only_inside_roi():
-    rng = np.random.default_rng(12)
-    signal = rng.normal(0, 1e-4, 2500)
-    signal[1800:1900] += 0.01
-    signal[2200:] += 0.02  # Must not be detected outside the Uh ROI.
-    roi = {"roi_id": "ROI_0", "left_idx": 1750, "right_idx": 1950}
-    candidates, diagnostics = detect_roi_candidates(
-        signal, [roi], fs=100, config=ExperimentConfig())
-    assert any(c["direction"] == 1 and abs(c["center_idx"] - 1800) <= 1 for c in candidates)
-    assert any(c["direction"] == -1 and abs(c["center_idx"] - 1900) <= 1 for c in candidates)
-    assert all(1750 <= c["center_idx"] <= 1950 for c in candidates)
-    assert all(c["detector_name"] == "median_diff" for c in candidates)
-    assert set(("roi_id", "center_idx", "region_start_idx", "region_end_idx",
-                "direction", "detector_score", "detector_name")) <= candidates[0].keys()
-    assert 1 in diagnostics["scale_scores"]
-
-
 def test_udeco_detection_extends_only_the_left_side_of_logical_roi():
     signal = np.zeros(2500)
     signal[1798:1820] = 0.01
@@ -169,7 +151,7 @@ def test_derivative_extrema_selects_one_signed_boundary_per_roi():
 
     candidates, diagnostics = detect_roi_candidates(
         signal, [roi], fs=100,
-        config=ExperimentConfig(edge_detector="derivative_extrema"))
+        config=ExperimentConfig())
 
     assert [(row["center_idx"], row["direction"]) for row in candidates] == [
         (1798, 1), (1820, -1)]
@@ -190,76 +172,11 @@ def test_derivative_extrema_keeps_only_available_direction_without_score_gate():
 
     candidates, _ = detect_roi_candidates(
         signal, [roi], fs=100,
-        config=ExperimentConfig(edge_detector="derivative_extrema"))
+        config=ExperimentConfig())
 
     assert len(candidates) == 1
     assert candidates[0]["direction"] == 1
     assert candidates[0]["detector_score"] < 3.0
-
-
-def test_haar_switch_uses_same_candidate_contract_and_fixed_baseline_noise():
-    rng = np.random.default_rng(13)
-    signal = rng.normal(0, 1e-4, 2500)
-    signal[1800:1900] += 0.01
-    roi = {"roi_id": "ROI_0", "left_idx": 1750, "right_idx": 1950}
-    cfg = ExperimentConfig(edge_detector="haar")
-    candidates, diagnostics = detect_roi_candidates(signal, [roi], fs=100, config=cfg)
-    assert any(c["direction"] == 1 and abs(c["center_idx"] - 1800) <= 5 for c in candidates)
-    assert any(c["direction"] == -1 and abs(c["center_idx"] - 1900) <= 5 for c in candidates)
-    assert all(c["detector_name"] == "haar" for c in candidates)
-    assert all(c["roi_id"] == "ROI_0" for c in candidates)
-    assert diagnostics["scale_sigmas"]
-    altered = signal.copy()
-    altered[2050:] += rng.normal(0, 0.1, len(altered[2050:]))
-    _, altered_diagnostics = detect_roi_candidates(altered, [roi], fs=100, config=cfg)
-    assert diagnostics["scale_sigmas"] == altered_diagnostics["scale_sigmas"]
-
-
-def _localized_synthetic(signal, center, *, fs=100):
-    roi = {"roi_id": "ROI_0", "left_idx": center - 45, "right_idx": center + 80}
-    candidate = {"roi_id": "ROI_0", "center_idx": center, "direction": 1,
-                 "region_start_idx": center, "region_end_idx": center,
-                 "detector_score": 20.0, "detector_name": "median_diff"}
-    noise = {"sigma_udeco": 1e-4, "sigma_du": 1e-4}
-    return localize_roi_candidates(signal, signal, [candidate], [roi],
-                                   fs=fs, noise=noise, config=ExperimentConfig())[0]
-
-
-def test_localization_separates_one_cycle_step_from_seventy_ms_ramp():
-    step = np.zeros(2200)
-    step[1800:] = 0.01
-    sharp = _localized_synthetic(step, 1800)
-    assert sharp["resolved"]
-    assert sharp["start_idx"] == 1799
-    assert sharp["end_idx"] == 1800
-    assert sharp["T_edge"] == 0.01
-    assert sharp["derivative_peak_width"] == 0.01
-
-    ramp = np.zeros(2200)
-    ramp[1800:1807] = np.arange(1, 8) * 0.01 / 7
-    ramp[1807:] = 0.01
-    gradual = _localized_synthetic(ramp, 1803)
-    assert gradual["resolved"]
-    assert abs(gradual["start_idx"] - 1799) <= 1
-    assert abs(gradual["T_edge"] - 0.07) <= 0.01
-    assert gradual["derivative_peak_width"] >= 0.06
-
-
-def test_localization_can_finish_beyond_logical_roi_right_boundary():
-    signal = np.zeros(2200)
-    signal[1848:1858] = np.arange(1, 11) * 0.001
-    signal[1858:] = 0.01
-    roi = {"roi_id": "ROI_0", "left_idx": 1800,
-           "search_left_idx": 1797, "right_idx": 1850}
-    candidate = {"roi_id": "ROI_0", "center_idx": 1849, "direction": 1,
-                 "region_start_idx": 1849, "region_end_idx": 1849,
-                 "detector_score": 20.0, "detector_name": "median_diff"}
-    measured = localize_roi_candidates(
-        signal, signal, [candidate], [roi], fs=100,
-        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4},
-        config=ExperimentConfig())[0]
-    assert measured["resolved"]
-    assert measured["end_idx"] > roi["right_idx"]
 
 
 def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
@@ -271,7 +188,7 @@ def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
            "search_left_idx": 1797, "right_idx": 1850}
     candidates, _ = detect_roi_candidates(
         signal, [roi], fs=100,
-        config=ExperimentConfig(edge_detector="derivative_extrema"))
+        config=ExperimentConfig())
     rising = next(row for row in candidates if row["direction"] == 1)
     measured = localize_roi_candidates(
         signal, signal, [rising], [roi], fs=100,
@@ -282,89 +199,6 @@ def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
     assert measured["start_idx"] == 1848
     assert measured["end_idx"] > roi["right_idx"] + 20
     assert np.isclose(measured["core_threshold"], 0.0003)
-
-
-def test_localization_can_start_before_left_search_boundary():
-    signal = np.zeros(2200)
-    signal[1794:1802] = np.arange(1, 9) * 0.001
-    signal[1802:] = 0.008
-    roi = {"roi_id": "ROI_0", "left_idx": 1800,
-           "search_left_idx": 1797, "right_idx": 1850}
-    candidate = {"roi_id": "ROI_0", "center_idx": 1798, "direction": 1,
-                 "region_start_idx": 1798, "region_end_idx": 1798,
-                 "detector_score": 20.0, "detector_name": "median_diff"}
-    measured = localize_roi_candidates(
-        signal, signal, [candidate], [roi], fs=100,
-        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4},
-        config=ExperimentConfig())[0]
-    assert measured["resolved"]
-    assert measured["start_idx"] < roi["search_left_idx"]
-
-
-def test_fast_step_with_long_tail_is_classified_by_edge_duration():
-    signal = np.zeros(2200)
-    signal[1800:] = 0.01
-    signal[1801:1822] += np.arange(1, 22) * 0.0003
-    signal[1822:] += 21 * 0.0003
-    localized = _localized_synthetic(signal, 1800)
-    table = build_event_table(
-        [localized], [{"roi_id": "ROI_0", "left_idx": 1755,
-                       "main_peak_idx": 1810, "right_idx": 1880}], channel="Udeco2",
-        sigma_udeco=1e-4, fs=100, config=ExperimentConfig(),
-        direction_map={1: {"sharp": "detach", "gradual": "release"},
-                       -1: {"sharp": "attach", "gradual": "pressure"}})
-    assert localized["T_edge"] == 0.01
-    assert "T_tail" not in localized
-    assert table.iloc[0]["morphology"] == "sharp"
-    assert table.iloc[0]["event_label"] is None
-
-
-def test_roi_requires_left_then_peak_opposite_edges_and_prefers_peak_amplitude():
-    base = {"roi_id": "ROI_0", "resolved": True, "T_edge": 0.01,
-            "direction": 1, "derivative_peak": 0.002,
-            "normalized_derivative_peak": 20.0, "derivative_peak_width": 0.01,
-            "monotonicity": 1.0, "detector_name": "median_diff"}
-    localized = [{**base, "center_idx": 105, "start_idx": 105, "delta": 0.01},
-                 {**base, "center_idx": 145, "start_idx": 145, "delta": 0.02},
-                 {**base, "center_idx": 165, "start_idx": 165,
-                  "direction": -1, "delta": -0.008},
-                 {**base, "center_idx": 205, "start_idx": 205,
-                  "direction": -1, "delta": -0.03}]
-    table = build_event_table(
-        localized, [{"roi_id": "ROI_0", "left_idx": 100, "search_left_idx": 97,
-                     "main_peak_idx": 160, "right_idx": 220}], channel="Udeco2",
-        sigma_udeco=1e-4, fs=100, config=ExperimentConfig(),
-        direction_map={1: {"sharp": "detach", "gradual": "release"},
-                       -1: {"sharp": "attach", "gradual": "pressure"}})
-    assert table.loc[table.is_main_rising, "center_idx"].tolist() == [145]
-    assert table.loc[table.is_main_falling, "center_idx"].tolist() == [205]
-    assert table.loc[table.center_idx == 165, "is_main_falling"].item() == False
-    assert set(table.loc[table.edge_role.notna(), "edge_role"]) == {"left", "peak"}
-
-
-def test_cross_roi_duplicate_prefers_later_roi_and_missing_pair_stays_unpaired():
-    base = {"resolved": True, "T_edge": 0.01,
-            "derivative_peak_width": 0.01, "normalized_derivative_peak": 20.0,
-            "detector_name": "median_diff"}
-    localized = [{**base, "roi_id": "ROI_0", "center_idx": 199,
-                  "start_idx": 199, "direction": 1, "delta": 0.01},
-                 {**base, "roi_id": "ROI_1", "center_idx": 199,
-                  "start_idx": 199, "direction": 1, "delta": 0.01},
-                 {**base, "roi_id": "ROI_1", "center_idx": 249,
-                  "start_idx": 249, "direction": -1, "delta": -0.01}]
-    rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200,
-             "main_peak_idx": 150},
-            {"roi_id": "ROI_1", "left_idx": 201, "search_left_idx": 198,
-             "right_idx": 300, "main_peak_idx": 250}]
-    table = build_event_table(
-        localized, rois, channel="Udeco2", sigma_udeco=1e-4,
-        fs=100, config=ExperimentConfig(),
-        direction_map={1: {"sharp": "detach", "gradual": "release"},
-                       -1: {"sharp": "attach", "gradual": "pressure"}})
-    assert table.loc[table.roi_id == "ROI_0", "overlap_duplicate"].item() == True
-    assert table.loc[table.roi_id == "ROI_0", "is_main_rising"].item() == False
-    assert table.loc[table.is_main_rising, "roi_id"].tolist() == ["ROI_1"]
-    assert table.loc[table.is_main_falling, "roi_id"].tolist() == ["ROI_1"]
 
 
 def _direct_edge(roi_id, center, direction, *, delta=None, resolved=True):
@@ -396,8 +230,8 @@ def test_direct_selection_displays_both_extrema_without_position_pair_gate():
     assert table.is_main_rising.tolist() == [True, False]
     assert table.is_main_falling.tolist() == [False, True]
     assert table.pair_status.tolist() == ["unpaired", "unpaired"]
-    assert table.event_label.tolist() == ["detach", None]
-    assert table.classification_status.tolist() == ["classified", "localization_failed"]
+    assert table.event_label.tolist() == [None, None]
+    assert table.classification_status.tolist() == ["roi_missing_pair", "roi_missing_pair"]
 
 
 def test_direct_classification_uses_strict_absolute_delta_and_flags_sign_conflict():
@@ -407,8 +241,8 @@ def test_direct_classification_uses_strict_absolute_delta_and_flags_sign_conflic
         _direct_edge("ROI_0", 150, 1, delta=0.0002),
         _direct_edge("ROI_1", 250, 1, delta=-0.0003)], rois)
     assert table.pair_status.tolist() == ["unpaired", "unpaired"]
-    assert table.event_label.tolist() == [None, "detach"]
-    assert table.classification_status.tolist() == ["low_amplitude", "classified"]
+    assert table.event_label.tolist() == [None, None]
+    assert table.classification_status.tolist() == ["roi_missing_pair", "roi_missing_pair"]
     assert table.direction_delta_conflict.tolist() == [False, True]
 
 
@@ -421,7 +255,7 @@ def test_direct_cross_roi_duplicate_is_diagnostic_only():
         _direct_edge("ROI_1", 199, 1, delta=0.01)], rois)
     assert table.overlap_duplicate.tolist() == [True, False]
     assert table.is_main_rising.tolist() == [True, True]
-    assert table.event_label.tolist() == ["detach", "detach"]
+    assert table.event_label.tolist() == [None, None]
 
 
 def test_single_slow_uh_peak_uses_refined_bounds_without_margin():
@@ -436,32 +270,12 @@ def test_single_slow_uh_peak_uses_refined_bounds_without_margin():
     assert rois[0]["right_idx"] == peaks[0]["refined_right_idx"]
 
 
-def test_nearby_candidate_centers_localize_distinct_steps():
-    signal = np.zeros(2200)
-    signal[1800:] += 0.01
-    signal[1810:] += 0.02
-    roi = {"roi_id": "ROI_0", "left_idx": 1750, "right_idx": 1880}
-    candidates = [{"roi_id": "ROI_0", "center_idx": center, "direction": 1,
-                   "region_start_idx": center, "region_end_idx": center,
-                   "detector_score": 20.0, "detector_name": "median_diff"}
-                  for center in (1800, 1810)]
-    measured = localize_roi_candidates(
-        signal, signal, candidates, [roi], fs=100,
-        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=ExperimentConfig())
-    assert measured[0]["derivative_peak_idx"] == 1800
-    assert measured[0]["resolved"]
-    assert np.isclose(measured[0]["delta"], 0.01)
-    assert measured[1]["resolved"]
-    assert measured[1]["derivative_peak_idx"] == 1810
-    assert np.isclose(measured[1]["delta"], 0.02)
-
-
 def test_extrema_localization_keeps_roi_anchor_when_stronger_peak_is_outside():
     signal = np.zeros(2200)
     signal[1800:] = .01
     signal[1810:] += .02
     roi = {"roi_id": "ROI_0", "left_idx": 1798, "search_left_idx": 1797, "right_idx": 1801}
-    cfg = ExperimentConfig(edge_detector="derivative_extrema")
+    cfg = ExperimentConfig()
     candidates, _ = detect_roi_candidates(signal, [roi], fs=100, config=cfg)
     measured = localize_roi_candidates(signal, signal, candidates, [roi], fs=100,
                                        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=cfg)[0]
@@ -496,7 +310,7 @@ def test_delta_uses_edge_signal_endpoints_without_stable_plateaus():
     edge[1807:1814] = .007 - np.arange(1, 8) * .001
     roi = {"roi_id": "ROI_0", "left_idx": 1795, "search_left_idx": 1792,
            "right_idx": 1815}
-    cfg = ExperimentConfig(edge_detector="derivative_extrema")
+    cfg = ExperimentConfig()
     candidates, _ = detect_roi_candidates(edge, [roi], fs=100, config=cfg)
     # The clean trace has a different scale; delta must use edge_signal.
     rows = localize_roi_candidates(edge * 10, edge, candidates, [roi], fs=100,
@@ -523,27 +337,6 @@ def test_weak_peak_and_unfinished_edge_keep_failure_reason():
     unfinished = localize_roi_candidates(rising, rising, [{**candidate, "center_idx": 1801}], [roi], fs=100,
                                          noise=noise, config=ExperimentConfig(extrema_trace_sec=.1))[0]
     assert unfinished["reason"] == "core_does_not_end"
-
-
-def test_left_start_requires_two_quiet_differences_and_threshold_override():
-    signal = np.zeros(2200)
-    signal[1798:] += .0001
-    signal[1799:] += .001
-    signal[1800:] += .01
-    roi = {"roi_id": "ROI_0", "left_idx": 1790, "right_idx": 1820}
-    candidate = {"roi_id": "ROI_0", "center_idx": 1800, "direction": 1,
-                 "detector_name": "median_diff"}
-    cfg = ExperimentConfig(threshold_du=2, threshold_dupeak=.15)
-    row = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
-                                  noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=cfg)[0]
-    assert row["resolved"]
-    assert row["start_idx"] == 1799
-    assert np.isclose(row["core_threshold"], .0015)
-    stronger_floor = ExperimentConfig(threshold_du=200, threshold_dupeak=.15)
-    weak = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
-                                   noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4},
-                                   config=stronger_floor)[0]
-    assert weak["reason"] == "weak_derivative"
 
 
 def test_peak_fallback_positive_and_negative_turn_beyond_roi():
@@ -619,7 +412,7 @@ def test_extrema_left_reversal_and_second_right_reverse_sample():
     assert row["start_rule"] == "reversal"
     assert row["end_rule"] == "second_reversal"
     assert np.isclose(row["threshold_left"], .03)
-    assert np.isclose(row["threshold_right"], .02)
+    assert np.isclose(row["threshold_right"], .03)
     steps[13] = -.03
     row = _extrema_from_steps(steps)
     assert row["end_idx"] == 13
@@ -655,25 +448,92 @@ def test_peak_fallback_selects_mean_centered_extreme():
         assert {row["fallback_peak_idx"] for row in rows} == {4}
 
 
-def test_extrema_asymmetric_override_does_not_change_other_detector():
+def test_extrema_right_modes_use_signed_neighbors_and_exact_endpoint_samples():
+    base = np.zeros(30)
+    base[8] = -.04  # A negative neighbor is compared as signed, not absolute.
+    base[9:14] = [.05, .2, .02, .02, .02]
+    sharp = _extrema_from_steps(base)
+    assert sharp["right_mode"] == "positive_isolated"
+    assert sharp["right_quiet_points"] == 2
+    assert np.isclose(sharp["threshold_right"], .03)
+    assert (sharp["end_idx"], sharp["end_rule"]) == (11, "threshold")
+
+    broad = base.copy()
+    broad[9] = .11
+    broad[11:15] = [.01, .01, .01, .01]
+    row = _extrema_from_steps(broad)
+    assert row["right_mode"] == "positive_broad"
+    assert row["right_quiet_points"] == 3
+    assert np.isclose(row["threshold_right"], .02)
+    assert (row["end_idx"], row["end_rule"]) == (12, "threshold")
+
+    negative = _extrema_from_steps(-broad, direction=-1)
+    assert negative["right_mode"] == "negative"
+    assert negative["right_quiet_points"] == 3
+    assert negative["end_idx"] == 12
+
+
+def test_extrema_right_threshold_overrides_and_second_reversal_precedence():
     steps = np.zeros(30)
-    steps[8:13] = [.04, .04, .2, .025, .025]
-    default = _extrema_from_steps(steps)
-    override = ExperimentConfig(threshold_du_left=5, threshold_dupeak_left=.01,
-                                threshold_du_right=4, threshold_dupeak_right=.01)
-    changed = _extrema_from_steps(steps, config=override)
-    assert np.isclose(default["threshold_left"], .03)
-    assert np.isclose(default["threshold_right"], .02)
-    assert np.isclose(changed["threshold_left"], .05)
-    assert np.isclose(changed["threshold_right"], .04)
-    signal = np.r_[0.0, np.cumsum(steps)]
-    roi = {"roi_id": "ROI_0", "left_idx": 1, "right_idx": len(signal)-2}
-    candidate = {"roi_id": "ROI_0", "center_idx": 11, "direction": 1,
-                 "detector_name": "haar"}
-    noise = {"sigma_udeco": .01, "sigma_du": .01}
-    original = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
-                                       noise=noise, config=ExperimentConfig())[0]
-    retained = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
-                                       noise=noise, config=override)[0]
-    assert (original["start_idx"], original["end_idx"]) == (retained["start_idx"], retained["end_idx"])
-    assert original["threshold_left"] == retained["threshold_left"]
+    steps[8:15] = [-.04, .05, .2, .04, -.03, .04, -.03]
+    row = _extrema_from_steps(steps)
+    assert (row["end_idx"], row["end_rule"]) == (14, "second_reversal")
+    isolated = steps.copy()
+    isolated[11:15] = [.02, .02, .02, .02]
+    cfg = ExperimentConfig(threshold_du_rightup=4, threshold_dupeak_rightup=.25)
+    changed = _extrema_from_steps(isolated, config=cfg)
+    assert changed["right_mode"] == "positive_isolated"
+    assert np.isclose(changed["threshold_right"], .05)
+    assert changed["right_quiet_points"] == 2
+
+
+def test_roi_classification_requires_amplitude_matched_qualified_pair():
+    rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200}]
+    for rise_delta, fall_delta, status in (
+            (.01, -.005, "classified"),
+            (.01, -.0049, "roi_delta_mismatch"),
+            (.01, -.0002, "roi_missing_pair")):
+        table = _direct_table([_direct_edge("ROI_0", 130, 1, delta=rise_delta),
+                               _direct_edge("ROI_0", 170, -1, delta=fall_delta)], rois)
+        assert set(table.classification_status) == {status}
+        assert table.morphology.notna().all() == (status == "classified")
+        assert table.event_label.notna().all() == (status == "classified")
+        assert table.is_main_rising.sum() == table.is_main_falling.sum() == 1
+    single = _direct_table([_direct_edge("ROI_0", 130, 1, delta=.01)], rois)
+    assert single.classification_status.item() == "roi_missing_pair"
+    assert single.event_label.isna().all()
+
+
+def test_fallback_main_pair_controls_roi_classification():
+    rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200}]
+    original = [_direct_edge("ROI_0", 125, 1, delta=.02),
+                _direct_edge("ROI_0", 175, -1, resolved=False)]
+    fallback = [_direct_edge("ROI_0", 140, 1, delta=.01),
+                _direct_edge("ROI_0", 160, -1, delta=-.006)]
+    for row in fallback:
+        row["detector_name"] = "peak_fallback"
+    table = _direct_table(original + fallback, rois)
+    assert set(table.main_source) == {"peak_fallback"}
+    assert table.loc[table.detector_name == "peak_fallback", "event_label"].notna().all()
+    original_rise = table.loc[(table.detector_name == "derivative_extrema")
+                              & (table.direction == 1)].iloc[0]
+    assert original_rise.classification_status == "not_main"
+    assert original_rise.event_label is None
+    assert original_rise.morphology is None
+    fallback[1]["delta"] = -.004
+    mismatched = _direct_table(original + fallback, rois)
+    assert set(mismatched.classification_status) == {"roi_delta_mismatch"}
+    assert mismatched.event_label.isna().all()
+
+
+def test_positive_broad_right_floor_and_neighbor_ratio_are_overridable():
+    steps = np.zeros(30)
+    steps[8:15] = [-.04, .11, .2, .01, .01, .01, .01]
+    base = _extrema_from_steps(steps, config=ExperimentConfig(
+        threshold_du_right=4, threshold_dupeak_right=.01))
+    assert base["right_mode"] == "positive_broad"
+    assert np.isclose(base["threshold_right"], .04)
+    assert base["right_quiet_points"] == 3
+    reclassified = _extrema_from_steps(steps, config=ExperimentConfig(
+        rightup_neighbor_ratio=.6))
+    assert reclassified["right_mode"] == "positive_isolated"

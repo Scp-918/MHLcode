@@ -11,13 +11,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from numpy.lib.stride_tricks import sliding_window_view
 from scipy.signal import find_peaks
 
 from udeco_analysis import (AnalysisConfig, _repair_pydisplay_sequence,
                             detect_motion_stage, load_udeco_sample)
-from udeco_edge_detection import (CascadeStateConfig, estimate_context_trend,
-                                  median_clean, merge_candidate_fragments)
+from udeco_edge_detection import CascadeStateConfig, estimate_context_trend, median_clean
 
 
 @dataclass(frozen=True)
@@ -34,31 +32,23 @@ class ExperimentConfig:
     fft_min_hz: float = 0.5
     fft_max_hz: float = 5.0
     udeco_left_lead_sec: float = 0.03
-    edge_detector: str = "median_diff"
-    median_diff_windows: tuple[int, ...] = (1, 3, 5, 7)
-    edge_score_sigma: float = 3.5
     candidate_merge_sec: float = 0.02
     localize_search_sec: float = 0.20
     extrema_trace_sec: float = 1.0
-    threshold_dupeak: float = 0.15
     threshold_du: float = 2.0
     threshold_du_left: float = 2.0
     threshold_dupeak_left: float = 0.15
     threshold_du_right: float = 2.0
     threshold_dupeak_right: float = 0.08
+    threshold_du_rightup: float = 3.0
+    threshold_dupeak_rightup: float = 0.15
+    rightup_neighbor_ratio: float = 0.5
+    delta_mismatch_fraction: float = 0.5
     core_end_min_points: int = 2
     sharp_edge_duration_sec: float = 0.05
     deriv_peak_width_threshold_sec: float = 0.04
     deriv_peak_sigma_k: float = 5.0
     min_amplitude_sigma_k: float = 2.0
-    haar_scales_sec: tuple[float, ...] = (0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56)
-    haar_single_scale_sigma: float = 3.5
-    haar_derivative_sigma: float = 3.5
-    haar_min_scale_support: int = 2
-    haar_merge_sec: float = 0.08
-    haar_fragment_merge_sec: float = 0.02
-    haar_fragment_min_spearman: float = 0.50
-    haar_fragment_min_forward_fraction: float = 0.60
 
 
 def load_paired_sample(sensor_csv: str | Path, *, data_root: str | Path, fs: int) -> dict:
@@ -266,121 +256,6 @@ def _main_peak_rois(values: np.ndarray, main_peaks: list[dict], peaks: list[dict
     return rois
 
 
-def _window_change(values: np.ndarray, width: int) -> np.ndarray:
-    """Right median minus left median at a sample boundary; width 1 is diff."""
-    result = np.zeros(len(values), dtype=float)
-    if 2 * width > len(values):
-        return result
-    medians = np.median(sliding_window_view(values, width), axis=1)
-    centers = np.arange(width, len(values) - width + 1)
-    result[centers] = medians[centers] - medians[centers - width]
-    return result
-
-
-def _detector_scales(values: np.ndarray, widths: list[tuple[int, int | float]],
-                     baseline_n: int) -> tuple[dict, dict, dict]:
-    responses, scores, sigmas = {}, {}, {}
-    for width, label in widths:
-        response = _window_change(values, width)
-        baseline = response[width:baseline_n-width+1]
-        sigma = float(np.std(baseline))
-        responses[label] = response
-        scores[label] = response / max(sigma, np.finfo(float).eps)
-        sigmas[label] = sigma
-    return responses, scores, sigmas
-
-
-def _best_signed_score(scale_scores: dict, n: int) -> np.ndarray:
-    best = np.zeros(n, dtype=float)
-    for row in scale_scores.values():
-        stronger = np.abs(row) > np.abs(best)
-        best[stronger] = row[stronger]
-    return best
-
-
-def _score_regions(score: np.ndarray, roi: dict, threshold: float,
-                   merge_points: int) -> list[np.ndarray]:
-    lo, hi = roi.get("search_left_idx", roi["left_idx"]), roi["right_idx"]
-    active = np.arange(lo, hi + 1)
-    active = active[np.abs(score[active]) >= threshold]
-    if not len(active):
-        return []
-    groups = [[int(active[0])]]
-    for index in active[1:]:
-        previous = groups[-1][-1]
-        if index - previous <= merge_points and np.sign(score[index]) == np.sign(score[previous]):
-            groups[-1].append(int(index))
-        else:
-            groups.append([int(index)])
-    return [np.asarray(group, dtype=int) for group in groups]
-
-
-def _median_candidates(scores: dict, combined: np.ndarray, roi: dict,
-                       fs: float, config: ExperimentConfig) -> list[dict]:
-    regions = _score_regions(combined, roi, config.edge_score_sigma,
-                             max(1, round(config.candidate_merge_sec * fs)))
-    candidates = []
-    for indices in regions:
-        center = int(indices[np.argmax(np.abs(combined[indices]))])
-        candidates.append({"roi_id": roi["roi_id"], "center_idx": center,
-                           "region_start_idx": int(indices[0]),
-                           "region_end_idx": int(indices[-1]),
-                           "direction": int(np.sign(combined[center])),
-                           "detector_score": float(abs(combined[center])),
-                           "detector_name": "median_diff"})
-    return candidates
-
-
-def _haar_candidates(values: np.ndarray, scores: dict, combined: np.ndarray,
-                     derivative_score: np.ndarray, roi: dict, fs: float,
-                     config: ExperimentConfig) -> list[dict]:
-    primitive = []
-    groups = _score_regions(combined, roi, config.edge_score_sigma,
-                            max(1, round(config.haar_merge_sec * fs)))
-    for indices in groups:
-        center = int(indices[np.argmax(np.abs(combined[indices]))])
-        direction = int(np.sign(combined[center]))
-        support = [scale for scale, row in scores.items()
-                   if np.any(direction * row[indices] >= config.edge_score_sigma)]
-        peak_score = float(max(direction * scores[s][indices].max() if direction > 0
-                               else -scores[s][indices].min() for s in support))
-        if len(support) < config.haar_min_scale_support and peak_score < config.haar_single_scale_sigma:
-            continue
-        fine_scale = min(support)
-        fine_indices = indices[np.argmax(direction * scores[fine_scale][indices])]
-        primitive.append({"center_index": int(fine_indices),
-                          "coarse_start_index": int(indices[0]),
-                          "coarse_end_index": int(indices[-1]),
-                          "best_scale_s": float(fine_scale),
-                          "edge_score": direction * peak_score,
-                          "noise_scale": 1.0,
-                          "support_scales_s": tuple(support),
-                          "detection_channels": ("haar",)})
-    derivative_groups = _score_regions(derivative_score, roi,
-                                       config.haar_derivative_sigma, 1)
-    for indices in derivative_groups:
-        center = int(indices[np.argmax(np.abs(derivative_score[indices]))])
-        primitive.append({"center_index": center,
-                          "coarse_start_index": int(indices[0]),
-                          "coarse_end_index": int(indices[-1]),
-                          "best_scale_s": 1.0 / fs,
-                          "edge_score": float(derivative_score[center]),
-                          "noise_scale": 1.0, "support_scales_s": (),
-                          "detection_channels": ("derivative",)})
-    merge_config = CascadeStateConfig(
-        edge_fragment_merge_s=config.haar_fragment_merge_sec,
-        edge_fragment_min_spearman=config.haar_fragment_min_spearman,
-        edge_fragment_min_forward_fraction=config.haar_fragment_min_forward_fraction)
-    merged = merge_candidate_fragments(values, primitive, fs, merge_config)
-    return [{"roi_id": roi["roi_id"], "center_idx": int(row["center_index"]),
-             "region_start_idx": int(row["coarse_start_index"]),
-             "region_end_idx": int(row["coarse_end_index"]),
-             "direction": int(np.sign(row["edge_score"])),
-             "detector_score": float(abs(row["edge_score"])),
-             "detector_name": "haar",
-             "fragment_centers": row["fragment_centers"]} for row in merged]
-
-
 def _derivative_extrema_candidates(score: np.ndarray, roi: dict) -> list[dict]:
     """Return the strongest signed sample difference of each polarity in one ROI."""
     lo = roi.get("search_left_idx", roi["left_idx"])
@@ -401,47 +276,19 @@ def _derivative_extrema_candidates(score: np.ndarray, roi: dict) -> list[dict]:
 
 def detect_roi_candidates(edge_signal: np.ndarray, rois: list[dict], *, fs: float,
                           config: ExperimentConfig) -> tuple[list[dict], dict]:
-    """Find candidates within Uh ROIs, normalized only by first-15-s noise."""
+    """Find signed derivative extrema within Uh ROIs using fixed baseline noise."""
     values = np.asarray(edge_signal, dtype=float)
     baseline_n = round(config.baseline_sec * fs)
     if len(values) < baseline_n or baseline_n < 3:
         raise ValueError("recording must contain the complete baseline interval")
-    if config.edge_detector == "derivative_extrema":
-        derivative = np.zeros(len(values), dtype=float)
-        derivative[1:] = np.diff(values)
-        sigma_du = float(np.std(np.diff(values[:baseline_n])))
-        score = derivative / max(sigma_du, np.finfo(float).eps)
-        candidates = [candidate for roi in rois
-                      for candidate in _derivative_extrema_candidates(score, roi)]
-        diagnostics = {"derivative_signal": derivative, "derivative_score": score,
-                       "derivative_sigma": sigma_du, "detector_name": config.edge_detector}
-        return sorted(candidates, key=lambda item: (item["roi_id"], item["center_idx"])), diagnostics
-    if config.edge_detector == "median_diff":
-        widths = [(int(width), int(width)) for width in config.median_diff_windows]
-    elif config.edge_detector == "haar":
-        widths = [(max(2, round(scale * fs)), float(scale))
-                  for scale in config.haar_scales_sec if 2 * round(scale * fs) <= len(values)]
-    else:
-        raise ValueError(f"unknown EDGE_DETECTOR: {config.edge_detector}")
-    responses, scores, sigmas = _detector_scales(values, widths, baseline_n)
-    combined = _best_signed_score(scores, len(values))
-    diagnostics = {"scale_responses": responses, "scale_scores": scores,
-                   "scale_sigmas": sigmas, "combined_score": combined,
-                   "threshold": config.edge_score_sigma,
-                   "detector_name": config.edge_detector}
-    candidates = []
-    if config.edge_detector == "haar":
-        derivative = np.zeros(len(values), dtype=float)
-        difference = np.diff(values)
-        sigma_du = float(np.std(difference[:baseline_n-1]))
-        derivative[1:] = difference / max(sigma_du, np.finfo(float).eps)
-        diagnostics["derivative_score"] = derivative
-    for roi in rois:
-        if config.edge_detector == "median_diff":
-            candidates.extend(_median_candidates(scores, combined, roi, fs, config))
-        else:
-            candidates.extend(_haar_candidates(values, scores, combined, derivative,
-                                               roi, fs, config))
+    derivative = np.zeros(len(values), dtype=float)
+    derivative[1:] = np.diff(values)
+    sigma_du = float(np.std(np.diff(values[:baseline_n])))
+    score = derivative / max(sigma_du, np.finfo(float).eps)
+    candidates = [candidate for roi in rois
+                  for candidate in _derivative_extrema_candidates(score, roi)]
+    diagnostics = {"derivative_signal": derivative, "derivative_score": score,
+                   "derivative_sigma": sigma_du, "detector_name": "derivative_extrema"}
     return sorted(candidates, key=lambda item: (item["roi_id"], item["center_idx"])), diagnostics
 
 
@@ -464,14 +311,9 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                          key=lambda i: candidates[i]["center_idx"])
         for position, i in enumerate(ordered):
             center = int(candidates[i]["center_idx"])
-            if candidates[i]["detector_name"] == "derivative_extrema":
-                trace_radius = max(radius, round(config.extrema_trace_sec * fs))
-                outer_left = max(0, center - trace_radius)
-                outer_right = min(len(edge_signal) - 1, center + trace_radius)
-            else:
-                outer_left = max(0, roi_by_id[roi_id].get("search_left_idx", roi_by_id[roi_id]["left_idx"])
-                                 - radius)
-                outer_right = min(len(edge_signal) - 1, roi_by_id[roi_id]["right_idx"] + radius)
+            trace_radius = max(radius, round(config.extrema_trace_sec * fs))
+            outer_left = max(0, center - trace_radius)
+            outer_right = min(len(edge_signal) - 1, center + trace_radius)
             left = ((int(candidates[ordered[position-1]]["center_idx"]) + center) // 2
                     if position else outer_left)
             right = ((center + int(candidates[ordered[position+1]]["center_idx"])) // 2
@@ -479,43 +321,39 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
             neighbor_bounds[i] = (left, right)
     result = []
     for candidate_index, candidate in enumerate(candidates):
-        roi = roi_by_id[candidate["roi_id"]]
         search_left, search_right = neighbor_bounds[candidate_index]
         center = int(candidate["center_idx"])
         direction = int(candidate["direction"])
-        if candidate["detector_name"] == "derivative_extrema":
-            trace_radius = max(radius, round(config.extrema_trace_sec * fs))
-            left = max(0, center - trace_radius)
-            right = min(len(edge_signal) - 1, center + trace_radius)
-        else:
-            left = max(0, roi.get("search_left_idx", roi["left_idx"]) - radius)
-            right = min(len(edge_signal) - 1, roi["right_idx"] + radius)
-        lo = max(search_left, center - radius - 1)
-        hi = min(search_right - 1, center + radius)
-        if hi < lo:
+        trace_radius = max(radius, round(config.extrema_trace_sec * fs))
+        left = max(0, center - trace_radius)
+        right = min(len(edge_signal) - 1, center + trace_radius)
+        peak_k = center - 1
+        if not 0 <= peak_k < len(derivative):
             result.append(_unresolved(candidate, "no_derivative_window"))
             continue
-        # Extrema discovery already fixed the derivative peak inside the ROI.
-        # Do not move its anchor to a stronger transition outside that ROI.
-        peak_k = (center - 1 if candidate["detector_name"] == "derivative_extrema"
-                  else lo + int(np.argmax(direction * derivative[lo:hi+1])))
         peak = float(derivative[peak_k])
         if direction * peak < config.threshold_du * noise["sigma_du"]:
             result.append(_unresolved(candidate, "weak_derivative",
                                       derivative_peak_idx=peak_k + 1,
                                       derivative_peak=peak))
             continue
-        extrema = candidate["detector_name"] == "derivative_extrema"
-        threshold_left = max((config.threshold_du_left if extrema else config.threshold_du) * noise["sigma_du"],
-                             (config.threshold_dupeak_left if extrema else config.threshold_dupeak) * abs(peak))
-        threshold_right = max((config.threshold_du_right if extrema else config.threshold_du) * noise["sigma_du"],
-                              (config.threshold_dupeak_right if extrema else config.threshold_dupeak) * abs(peak))
+        threshold_left = max(config.threshold_du_left * noise["sigma_du"],
+                             config.threshold_dupeak_left * abs(peak))
+        isolated_up = (direction > 0 and 0 < peak_k < len(derivative) - 1
+                       and derivative[peak_k - 1] <= config.rightup_neighbor_ratio * peak
+                       and derivative[peak_k + 1] <= config.rightup_neighbor_ratio * peak)
+        right_mode = "positive_isolated" if isolated_up else "positive_broad" if direction > 0 else "negative"
+        threshold_right = max((config.threshold_du_rightup if isolated_up else config.threshold_du_right)
+                              * noise["sigma_du"],
+                              (config.threshold_dupeak_rightup if isolated_up else config.threshold_dupeak_right)
+                              * abs(peak))
+        right_quiet_points = 2 if isolated_up else 3
         core_threshold = threshold_left
         start_idx = None
         end_idx = None
         start_rule = None
         end_rule = None
-        if (extrema and peak_k >= left + 2 and peak_k + 2 < right
+        if (peak_k >= left + 2 and peak_k + 2 < right
                 and 0 < direction * derivative[peak_k - 1] < threshold_left
                 and 0 < direction * derivative[peak_k - 2] < threshold_left
                 and abs(derivative[peak_k + 1]) < threshold_right
@@ -525,7 +363,7 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
         low_run = 0
         if start_idx is None:
             for k in range(peak_k - 1, left - 1, -1):
-                if extrema and direction * derivative[k] < 0:
+                if direction * derivative[k] < 0:
                     start_idx, start_rule = k + 1, "reversal"
                     break
                 low_run = low_run + 1 if abs(derivative[k]) < threshold_left else 0
@@ -536,25 +374,29 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
             result.append(_unresolved(candidate, "core_does_not_start",
                                       derivative_peak_idx=peak_k + 1,
                                       derivative_peak=peak, core_threshold=core_threshold,
-                                      threshold_left=threshold_left, threshold_right=threshold_right))
+                                      threshold_left=threshold_left, threshold_right=threshold_right,
+                                      right_mode=right_mode, right_quiet_points=right_quiet_points))
             continue
         low_run = 0
         reverse_count = 0
         if end_idx is None:
             for k in range(peak_k + 1, right):
-                if extrema and direction * derivative[k] < 0:
+                if direction * derivative[k] < 0:
                     reverse_count += 1
                     if reverse_count >= 2:
                         end_idx, end_rule = k, "second_reversal"
                         break
                 low_run = low_run + 1 if abs(derivative[k]) < threshold_right else 0
-                if low_run >= config.core_end_min_points:
-                    end_idx, end_rule = k - low_run + 1, "threshold"
+                if low_run >= right_quiet_points:
+                    first_low_k = k - low_run + 1
+                    end_idx = first_low_k if isolated_up else first_low_k + 1
+                    end_rule = "threshold"
                     break
         partial = {"start_idx": start_idx, "end_idx": end_idx,
                    "derivative_peak_idx": peak_k + 1, "derivative_peak": peak,
                    "core_threshold": core_threshold,
                    "threshold_left": threshold_left, "threshold_right": threshold_right,
+                   "right_mode": right_mode, "right_quiet_points": right_quiet_points,
                    "start_rule": start_rule, "end_rule": end_rule}
         if end_idx is None:
             result.append(_unresolved(candidate, "core_does_not_end", **partial))
@@ -697,7 +539,7 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
                            "amplitude": abs(delta), "T_edge": (end - start) / fs,
                            "derivative_peak_idx": peak_idx, "derivative_peak": derivative_peak,
                            "core_threshold": max(config.threshold_du * noise["sigma_du"],
-                                                 config.threshold_dupeak * abs(derivative_peak)),
+                                                 config.threshold_dupeak_left * abs(derivative_peak)),
                            "normalized_derivative_peak": abs(derivative_peak) / max(noise["sigma_du"], np.finfo(float).eps),
                            "derivative_peak_width": (width_right - width_left + 1) / fs,
                            "derivative_fwhm_left_idx": width_left,
@@ -706,75 +548,6 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
                                                           >= -config.threshold_du * noise["sigma_du"])),
                            "baseline_snr": abs(delta) / max(noise["sigma_udeco"], np.finfo(float).eps)})
     return result
-
-
-def build_event_table(localized: list[dict], rois: list[dict], *, channel: str,
-                      sigma_udeco: float, fs: float, config: ExperimentConfig,
-                      direction_map: dict[int, dict[str, str]]) -> pd.DataFrame:
-    """Retain every candidate and select one ordered left/peak edge pair per ROI."""
-    rows = []
-    for item in localized:
-        row = {**item, "channel": channel, "is_main_rising": False,
-               "is_main_falling": False, "morphology": None, "event_label": None,
-               "edge_role": None, "pair_status": "missing_pair",
-               "overlap_duplicate": False, "duplicate_owner_roi_id": None}
-        if item.get("resolved"):
-            shape = "sharp" if item["T_edge"] <= config.sharp_edge_duration_sec else "gradual"
-            row["morphology"] = shape
-            row["derivative_support"] = (item["derivative_peak_width"] <= config.deriv_peak_width_threshold_sec
-                                         and item["normalized_derivative_peak"] >= config.deriv_peak_sigma_k)
-        rows.append(row)
-    table = pd.DataFrame(rows)
-    if table.empty:
-        return pd.DataFrame(columns=["channel", "roi_id", "center_idx", "direction", "delta",
-                                     "resolved", "is_main_rising", "is_main_falling",
-                                     "morphology", "event_label", "edge_role", "pair_status",
-                                     "overlap_duplicate"])
-    table["edge_position_idx"] = (table["start_idx"].fillna(table["center_idx"])
-                                  if "start_idx" in table else table["center_idx"])
-    duplicate_points = round(config.candidate_merge_sec * fs)
-    for earlier, later in zip(rois, rois[1:]):
-        later_search_left = later.get("search_left_idx", later["left_idx"])
-        earlier_rows = table.loc[(table.roi_id == earlier["roi_id"])
-                                 & (table.center_idx >= later_search_left)]
-        later_rows = table.loc[table.roi_id == later["roi_id"]]
-        for index, row in earlier_rows.iterrows():
-            matching = later_rows.loc[(later_rows.direction == row.direction)
-                                      & ((later_rows.center_idx - row.center_idx).abs()
-                                         <= duplicate_points)]
-            if not matching.empty:
-                table.at[index, "overlap_duplicate"] = True
-                table.at[index, "duplicate_owner_roi_id"] = later["roi_id"]
-    for roi in rois:
-        eligible = table.loc[(table.roi_id == roi["roi_id"])
-                             & (table.resolved == True)
-                             & (table.overlap_duplicate == False)
-                             & (table.direction * table.delta
-                                >= config.min_amplitude_sigma_k * sigma_udeco)]
-        left = roi["left_idx"]
-        peak = roi["main_peak_idx"]
-        right = roi["right_idx"]
-        peak_zone = eligible.loc[(eligible.center_idx >= (left + peak) // 2)
-                                 & (eligible.center_idx <= right)]
-        peak_zone = peak_zone.reindex(peak_zone.delta.abs().sort_values(ascending=False).index)
-        for peak_index, peak_edge in peak_zone.iterrows():
-            left_zone = eligible.loc[(eligible.center_idx
-                                      >= roi.get("search_left_idx", left))
-                                     & (eligible.center_idx <= peak)
-                                     & (eligible.center_idx < peak_edge.center_idx)
-                                     & (eligible.direction == -peak_edge.direction)]
-            if left_zone.empty:
-                continue
-            left_index = left_zone.delta.abs().idxmax()
-            for index, role in ((left_index, "left"), (peak_index, "peak")):
-                direction = int(table.at[index, "direction"])
-                table.at[index, "is_main_rising" if direction > 0 else "is_main_falling"] = True
-                table.at[index, "edge_role"] = role
-                shape = "sharp" if table.at[index, "T_edge"] <= config.sharp_edge_duration_sec else "gradual"
-                table.at[index, "event_label"] = direction_map[direction][shape]
-            table.loc[table.roi_id == roi["roi_id"], "pair_status"] = "paired"
-            break
-    return table
 
 
 def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel: str,
@@ -789,7 +562,6 @@ def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel
         direction = int(item["direction"])
         resolved = bool(item["resolved"])
         amplitude_pass = resolved and abs(item["delta"]) > config.min_amplitude_sigma_k * sigma_udeco
-        shape = ("sharp" if item["T_edge"] <= config.sharp_edge_duration_sec else "gradual") if amplitude_pass else None
         rows.append({**item, "channel": channel,
                      "is_main_rising": direction > 0, "is_main_falling": direction < 0,
                      "edge_role": ("roi_rising" if direction > 0 else
@@ -797,11 +569,10 @@ def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel
                      "pair_status": ("both_detected" if directions[item["roi_id"]] == {1, -1}
                                      else "missing_direction"),
                      "amplitude_pass": bool(amplitude_pass),
-                     "classification_status": ("classified" if amplitude_pass else
+                     "classification_status": ("not_main" if amplitude_pass else
                                                "low_amplitude" if resolved else "localization_failed"),
                      "direction_delta_conflict": bool(resolved and direction * item["delta"] < 0),
-                     "morphology": shape,
-                     "event_label": direction_map[direction][shape] if amplitude_pass else None,
+                     "morphology": None, "event_label": None,
                      "derivative_support": (item["derivative_peak_width"] <= config.deriv_peak_width_threshold_sec
                                             and item["normalized_derivative_peak"] >= config.deriv_peak_sigma_k)
                                             if resolved else None,
@@ -830,6 +601,27 @@ def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel
         table.loc[selected, "fallback_used"] = use_fallback
         table.loc[selected, "pair_status"] = ("fallback_localized" if use_fallback else
                                                "original_localized" if original_pair else "unpaired")
+        main_rows = table.loc[selected & (table.is_main_rising | table.is_main_falling)]
+        qualified = main_rows.loc[main_rows.resolved & main_rows.amplitude_pass]
+        rising = qualified.loc[qualified.is_main_rising]
+        falling = qualified.loc[qualified.is_main_falling]
+        if len(rising) != 1 or len(falling) != 1:
+            classification_status = "roi_missing_pair"
+        else:
+            rise = abs(float(rising.iloc[0].delta))
+            fall = abs(float(falling.iloc[0].delta))
+            classification_status = ("roi_delta_mismatch"
+                                     if abs(rise - fall) > config.delta_mismatch_fraction * max(rise, fall)
+                                     else None)
+        if classification_status:
+            table.loc[selected, ["morphology", "event_label"]] = None
+            table.loc[selected, "classification_status"] = classification_status
+        else:
+            for index, item in qualified.iterrows():
+                shape = "sharp" if item.T_edge <= config.sharp_edge_duration_sec else "gradual"
+                table.at[index, "morphology"] = shape
+                table.at[index, "event_label"] = direction_map[int(item.direction)][shape]
+                table.at[index, "classification_status"] = "classified"
     for earlier, later in zip(rois, rois[1:]):
         later_left = later.get("search_left_idx", later["left_idx"])
         earlier_rows = table.loc[(table.roi_id == earlier["roi_id"])
