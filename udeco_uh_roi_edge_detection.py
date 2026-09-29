@@ -36,16 +36,16 @@ class ExperimentConfig:
     localize_search_sec: float = 0.20
     extrema_trace_sec: float = 1.0
     threshold_du: float = 2.0
-    threshold_du_left: float = 2.0
-    threshold_dupeak_left: float = 0.15
-    threshold_du_right: float = 2.0
-    threshold_dupeak_right: float = 0.08
-    threshold_du_rightup: float = 3.0
-    threshold_dupeak_rightup: float = 0.15
-    rightup_neighbor_ratio: float = 0.5
+    threshold_du_sharp_left: float = 2.0
+    threshold_dupeak_sharp_left: float = 0.15
+    threshold_du_sharp_right: float = 3.0
+    threshold_dupeak_sharp_right: float = 0.40
+    threshold_du_general_left: float = 2.0
+    threshold_dupeak_general_left: float = 0.08
+    threshold_du_general_right: float = 2.0
+    threshold_dupeak_general_right: float = 0.08
+    sharp_neighbor_ratio: float = 0.5
     delta_mismatch_fraction: float = 0.5
-    core_end_min_points: int = 2
-    sharp_edge_duration_sec: float = 0.05
     deriv_peak_width_threshold_sec: float = 0.04
     deriv_peak_sigma_k: float = 5.0
     min_amplitude_sigma_k: float = 2.0
@@ -297,6 +297,15 @@ def _unresolved(candidate: dict, reason: str, **measurements) -> dict:
             "endpoint_source": "threshold", "search_limit": False}
 
 
+def _sharp_peak(derivative: np.ndarray, peak_k: int, direction: int,
+                neighbor_ratio: float) -> bool:
+    peak_size = direction * derivative[peak_k]
+    neighbors = [direction * derivative[k] for k in (peak_k - 1, peak_k + 1)
+                 if 0 <= k < len(derivative)]
+    return bool(neighbors) and not all(value > neighbor_ratio * peak_size
+                                       for value in neighbors)
+
+
 def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                             candidates: list[dict], rois: list[dict], *, fs: float,
                             noise: dict[str, float], config: ExperimentConfig) -> list[dict]:
@@ -337,66 +346,65 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                                       derivative_peak_idx=peak_k + 1,
                                       derivative_peak=peak))
             continue
-        threshold_left = max(config.threshold_du_left * noise["sigma_du"],
-                             config.threshold_dupeak_left * abs(peak))
-        isolated_up = (direction > 0 and 0 < peak_k < len(derivative) - 1
-                       and derivative[peak_k - 1] <= config.rightup_neighbor_ratio * peak
-                       and derivative[peak_k + 1] <= config.rightup_neighbor_ratio * peak)
-        right_mode = "positive_isolated" if isolated_up else "positive_broad" if direction > 0 else "negative"
-        threshold_right = max((config.threshold_du_rightup if isolated_up else config.threshold_du_right)
-                              * noise["sigma_du"],
-                              (config.threshold_dupeak_rightup if isolated_up else config.threshold_dupeak_right)
-                              * abs(peak))
-        right_quiet_points = 2 if isolated_up else 3
+        is_sharp = _sharp_peak(derivative, peak_k, direction, config.sharp_neighbor_ratio)
+        sharp_positive = direction > 0 and is_sharp
+        mode = "sharp" if sharp_positive else "general"
+        threshold_left = max(getattr(config, f"threshold_du_{mode}_left") * noise["sigma_du"],
+                             getattr(config, f"threshold_dupeak_{mode}_left") * abs(peak))
+        threshold_right = max(getattr(config, f"threshold_du_{mode}_right") * noise["sigma_du"],
+                              getattr(config, f"threshold_dupeak_{mode}_right") * abs(peak))
+        right_mode = "positive_sharp" if sharp_positive else "positive_general" if direction > 0 else "negative"
+        left_quiet_points = 2 if sharp_positive else 3
+        right_quiet_points = 2 if sharp_positive else 4
         core_threshold = threshold_left
         start_idx = None
         end_idx = None
         start_rule = None
         end_rule = None
-        if (peak_k >= left + 2 and peak_k + 2 < right
-                and 0 < direction * derivative[peak_k - 1] < threshold_left
-                and 0 < direction * derivative[peak_k - 2] < threshold_left
-                and abs(derivative[peak_k + 1]) < threshold_right
-                and abs(derivative[peak_k + 2]) < threshold_right):
-            start_idx, end_idx = peak_k - 2, peak_k + 1
-            start_rule = end_rule = "single_point"
         low_run = 0
-        if start_idx is None:
-            for k in range(peak_k - 1, left - 1, -1):
-                if direction * derivative[k] < 0:
-                    start_idx, start_rule = k + 1, "reversal"
+        reverse_count = 0
+        for k in range(peak_k - 1, left - 1, -1):
+            if sharp_positive and derivative[k] <= 0:
+                start_idx, start_rule = k + 1, "nonpositive"
+                break
+            if not sharp_positive and direction * derivative[k] < 0:
+                reverse_count += 1
+                if reverse_count == 2:
+                    start_idx, start_rule = k + 1, "second_reversal"
                     break
-                low_run = low_run + 1 if abs(derivative[k]) < threshold_left else 0
-                if low_run >= config.core_end_min_points:
-                    start_idx, start_rule = k + low_run, "threshold"
-                    break
+            low_run = low_run + 1 if abs(derivative[k]) < threshold_left else 0
+            if low_run >= left_quiet_points:
+                start_idx = k + 2
+                start_rule = "threshold"
+                break
         if start_idx is None:
             result.append(_unresolved(candidate, "core_does_not_start",
                                       derivative_peak_idx=peak_k + 1,
                                       derivative_peak=peak, core_threshold=core_threshold,
                                       threshold_left=threshold_left, threshold_right=threshold_right,
-                                      right_mode=right_mode, right_quiet_points=right_quiet_points))
+                                      right_mode=right_mode, left_quiet_points=left_quiet_points,
+                                      right_quiet_points=right_quiet_points, is_sharp=is_sharp))
             continue
         low_run = 0
         reverse_count = 0
-        if end_idx is None:
-            for k in range(peak_k + 1, right):
-                if direction * derivative[k] < 0:
-                    reverse_count += 1
-                    if reverse_count >= 2:
-                        end_idx, end_rule = k, "second_reversal"
-                        break
-                low_run = low_run + 1 if abs(derivative[k]) < threshold_right else 0
-                if low_run >= right_quiet_points:
-                    first_low_k = k - low_run + 1
-                    end_idx = first_low_k if isolated_up else first_low_k + 1
-                    end_rule = "threshold"
+        for k in range(peak_k + 1, right):
+            if not sharp_positive and direction * derivative[k] < 0:
+                reverse_count += 1
+                if reverse_count == 2:
+                    end_idx, end_rule = k, "second_reversal"
                     break
+            low_run = low_run + 1 if abs(derivative[k]) < threshold_right else 0
+            if low_run >= right_quiet_points:
+                first_low_k = k - low_run + 1
+                end_idx = first_low_k if sharp_positive else first_low_k + 1
+                end_rule = "threshold"
+                break
         partial = {"start_idx": start_idx, "end_idx": end_idx,
                    "derivative_peak_idx": peak_k + 1, "derivative_peak": peak,
                    "core_threshold": core_threshold,
                    "threshold_left": threshold_left, "threshold_right": threshold_right,
-                   "right_mode": right_mode, "right_quiet_points": right_quiet_points,
+                   "right_mode": right_mode, "left_quiet_points": left_quiet_points,
+                   "right_quiet_points": right_quiet_points, "is_sharp": is_sharp,
                    "start_rule": start_rule, "end_rule": end_rule}
         if end_idx is None:
             result.append(_unresolved(candidate, "core_does_not_end", **partial))
@@ -430,6 +438,27 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
 def _split_extrema_overlaps(rows, edge_signal, *, fs, noise, config):
     """Split overlapping opposite extrema at the quietest derivative sample."""
     derivative = np.diff(edge_signal, prepend=edge_signal[0])
+    steps = np.diff(edge_signal)
+    reach = max(1, round(config.extrema_trace_sec * fs))
+
+    def retrace(row, side):
+        center = int(row["center_idx"])
+        peak_k = center - 1
+        direction = int(row["direction"])
+        count = 0
+        if side == "left":
+            limit = max(0, center - reach)
+            scan = range(peak_k - 1, limit - 1, -1)
+        else:
+            limit = min(len(edge_signal) - 1, center + reach)
+            scan = range(peak_k + 1, limit)
+        for k in scan:
+            if direction * steps[k] < 0:
+                count += 1
+                if count == 2:
+                    return (k + 1 if side == "left" else k), "overlap_second_reversal", False
+        return limit, "overlap_search_limit", True
+
     changed = set()
     for roi_id in dict.fromkeys(row["roi_id"] for row in rows):
         pair = sorted((i for i, row in enumerate(rows)
@@ -450,12 +479,14 @@ def _split_extrema_overlaps(rows, edge_signal, *, fs, noise, config):
         split = lo + int(np.argmin(np.abs(derivative[lo:hi])))
         for row in (first, second):
             row["overlap_split_idx"] = split
-        if split < end:
-            first["end_idx"] = split
-            first["end_rule"] = "overlap_split"
-        if split + 1 > start:
-            second["start_idx"] = split + 1
-            second["start_rule"] = "overlap_split"
+        first["end_idx"] = split
+        first["end_rule"] = "overlap_split"
+        second["start_idx"] = split
+        second["start_rule"] = "overlap_split"
+        if first["end_idx"] <= first["start_idx"]:
+            first["start_idx"], first["start_rule"], first["search_limit"] = retrace(first, "left")
+        if second["end_idx"] <= second["start_idx"]:
+            second["end_idx"], second["end_rule"], second["search_limit"] = retrace(second, "right")
         changed.update(pair)
     for i in changed:
         row = rows[i]
@@ -473,16 +504,21 @@ def _split_extrema_overlaps(rows, edge_signal, *, fs, noise, config):
 
 
 def _fallback_boundary(values: np.ndarray, peak: int, limit: int, step: int) -> tuple[int, str]:
-    """Walk away from a signal peak until a growing opposite derivative appears."""
+    """Walk away from a signal peak until a growing or second reverse step."""
     edge_point = peak
     original_sign = 0
     previous_size = 0.0
+    reverse_count = 0
     for point in range(peak + step, limit + step, step):
         difference = values[point + 1] - values[point] if step < 0 else values[point] - values[point - 1]
         sign = int(np.sign(difference))
         size = abs(difference)
         if sign and original_sign and sign != original_sign and size > previous_size:
             return edge_point, "turn"
+        if sign and original_sign and sign != original_sign:
+            reverse_count += 1
+            if reverse_count == 2:
+                return edge_point, "second_reversal"
         if sign and not original_sign:
             original_sign = sign
         edge_point = point
@@ -524,9 +560,11 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
                                "reason": "invalid_fallback_edge", "start_idx": start, "end_idx": end})
                 continue
             local_derivative = derivative[start + 1:end + 1]
-            relative_peak = int(np.argmax(np.abs(local_derivative)))
+            relative_peak = int(np.argmax(direction * local_derivative))
             peak_idx = start + 1 + relative_peak
             derivative_peak = float(derivative[peak_idx])
+            is_sharp = _sharp_peak(np.diff(values), peak_idx - 1, direction,
+                                   config.sharp_neighbor_ratio)
             half_peak = abs(derivative_peak) / 2
             width_left = peak_idx
             while width_left > start + 1 and direction * derivative[width_left - 1] >= half_peak:
@@ -538,8 +576,9 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
                            "start_idx": start, "end_idx": end, "delta": delta,
                            "amplitude": abs(delta), "T_edge": (end - start) / fs,
                            "derivative_peak_idx": peak_idx, "derivative_peak": derivative_peak,
-                           "core_threshold": max(config.threshold_du * noise["sigma_du"],
-                                                 config.threshold_dupeak_left * abs(derivative_peak)),
+                           "is_sharp": is_sharp,
+                           "core_threshold": max(config.threshold_du_general_left * noise["sigma_du"],
+                                                 config.threshold_dupeak_general_left * abs(derivative_peak)),
                            "normalized_derivative_peak": abs(derivative_peak) / max(noise["sigma_du"], np.finfo(float).eps),
                            "derivative_peak_width": (width_right - width_left + 1) / fs,
                            "derivative_fwhm_left_idx": width_left,
@@ -572,7 +611,7 @@ def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel
                      "classification_status": ("not_main" if amplitude_pass else
                                                "low_amplitude" if resolved else "localization_failed"),
                      "direction_delta_conflict": bool(resolved and direction * item["delta"] < 0),
-                     "morphology": None, "event_label": None,
+                     "morphology": None, "event_label": None, "roi_mode": "cancelled",
                      "derivative_support": (item["derivative_peak_width"] <= config.deriv_peak_width_threshold_sec
                                             and item["normalized_derivative_peak"] >= config.deriv_peak_sigma_k)
                                             if resolved else None,
@@ -617,10 +656,13 @@ def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel
             table.loc[selected, ["morphology", "event_label"]] = None
             table.loc[selected, "classification_status"] = classification_status
         else:
+            rising_sharp = bool(rising.iloc[0].get("is_sharp", False))
+            roi_shape = "sharp" if rising_sharp else "gradual"
+            table.loc[selected, "roi_mode"] = ("detach-attach" if rising_sharp
+                                                 else "release-force")
             for index, item in qualified.iterrows():
-                shape = "sharp" if item.T_edge <= config.sharp_edge_duration_sec else "gradual"
-                table.at[index, "morphology"] = shape
-                table.at[index, "event_label"] = direction_map[int(item.direction)][shape]
+                table.at[index, "morphology"] = "sharp" if bool(item.get("is_sharp", False)) else "gradual"
+                table.at[index, "event_label"] = direction_map[int(item.direction)][roi_shape]
                 table.at[index, "classification_status"] = "classified"
     for earlier, later in zip(rois, rois[1:]):
         later_left = later.get("search_left_idx", later["left_idx"])

@@ -180,10 +180,10 @@ def test_derivative_extrema_keeps_only_available_direction_without_score_gate():
 
 
 def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
-    signal = np.zeros(2200)
-    signal[1849] = 0.002
-    signal[1850:1906] = 0.002 + np.arange(1, 57) * 0.0005
-    signal[1906:] = signal[1905]
+    steps = np.zeros(2200)
+    steps[1846:1905] = .0005
+    steps[1848] = .0006
+    signal = np.cumsum(steps)
     roi = {"roi_id": "ROI_0", "left_idx": 1800,
            "search_left_idx": 1797, "right_idx": 1850}
     candidates, _ = detect_roi_candidates(
@@ -194,18 +194,19 @@ def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
         signal, signal, [rising], [roi], fs=100,
         noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4},
         config=ExperimentConfig())[0]
-    assert rising["center_idx"] == 1849
+    assert rising["center_idx"] == 1848
     assert measured["resolved"]
-    assert measured["start_idx"] == 1848
+    assert measured["start_idx"] < 1849
     assert measured["end_idx"] > roi["right_idx"] + 20
-    assert np.isclose(measured["core_threshold"], 0.0003)
+    assert measured["right_mode"] == "positive_general"
 
 
-def _direct_edge(roi_id, center, direction, *, delta=None, resolved=True):
+def _direct_edge(roi_id, center, direction, *, delta=None, resolved=True, is_sharp=False):
     row = {"roi_id": roi_id, "center_idx": center, "direction": direction,
            "region_start_idx": center, "region_end_idx": center,
            "detector_name": "derivative_extrema", "detector_score": 8.0,
-           "resolved": resolved, "reason": None if resolved else "core_does_not_end"}
+           "resolved": resolved, "reason": None if resolved else "core_does_not_end",
+           "is_sharp": is_sharp}
     if resolved:
         row.update(start_idx=center - 1, end_idx=center,
                    delta=delta, T_edge=0.01,
@@ -218,7 +219,7 @@ def _direct_table(localized, rois):
         localized, rois, channel="Udeco2", sigma_udeco=1e-4, fs=100,
         config=ExperimentConfig(),
         direction_map={1: {"sharp": "detach", "gradual": "release"},
-                       -1: {"sharp": "attach", "gradual": "pressure"}})
+                       -1: {"sharp": "attach", "gradual": "force"}})
 
 
 def test_direct_selection_displays_both_extrema_without_position_pair_gate():
@@ -296,12 +297,57 @@ def test_overlapping_extrema_split_at_quietest_derivative_and_remeasure():
                             noise={"sigma_udeco": .01, "sigma_du": .001}, config=ExperimentConfig())
     first, second = rows
     assert first["overlap_split_idx"] == second["overlap_split_idx"] == 21
-    assert first["end_idx"] < second["start_idx"]
+    assert first["end_idx"] == second["start_idx"] == 21
     assert first["end_rule"] == "overlap_split"
-    assert second["start_idx"] == 35
     assert first["T_edge"] == .02
     assert first["delta"] == 1
     assert np.isclose(second["delta"], -.8)
+
+
+def test_zero_length_overlap_edges_retrace_to_second_reversal():
+    from udeco_uh_roi_edge_detection import _split_extrema_overlaps
+
+    signal = np.zeros(40)
+    signal[17:20] = [.2, .1, 0]
+    signal[20:24] = 1
+    signal[24:26] = [.2, .3]
+    signal[26:] = .4
+    rows = [dict(roi_id="ROI_0", detector_name="derivative_extrema", center_idx=20,
+                 direction=1, start_idx=21, end_idx=25, resolved=True),
+            dict(roi_id="ROI_0", detector_name="derivative_extrema", center_idx=24,
+                 direction=-1, start_idx=19, end_idx=21, resolved=True)]
+    _split_extrema_overlaps(rows, signal, fs=100,
+                            noise={"sigma_udeco": .01, "sigma_du": .001},
+                            config=ExperimentConfig())
+    assert rows[0]["end_idx"] == rows[1]["start_idx"] == 21
+    assert rows[0]["start_idx"] == 18
+    assert rows[1]["end_idx"] == 25
+    assert rows[0]["start_rule"] == "overlap_second_reversal"
+    assert rows[1]["end_rule"] == "overlap_second_reversal"
+    assert all(row["resolved"] for row in rows)
+
+
+def test_fallback_boundary_stops_at_second_reverse_when_old_turn_does_not():
+    from udeco_uh_roi_edge_detection import _fallback_boundary
+
+    steps = np.zeros(20)
+    steps[10:14] = [-.1, .05, -.1, .05]
+    values = np.r_[0, np.cumsum(steps)]
+    assert _fallback_boundary(values, 10, 15, 1) == (13, "second_reversal")
+
+
+def test_roi_mode_uses_rising_shape_and_keeps_falling_shape_diagnostic():
+    rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200},
+            {"roi_id": "ROI_1", "left_idx": 201, "right_idx": 300}]
+    table = _direct_table([
+        _direct_edge("ROI_0", 120, 1, delta=.01, is_sharp=True),
+        _direct_edge("ROI_0", 150, -1, delta=-.01),
+        _direct_edge("ROI_1", 220, 1, delta=.01),
+        _direct_edge("ROI_1", 250, -1, delta=-.01, is_sharp=True)], rois)
+    assert table.roi_mode.tolist() == ["detach-attach", "detach-attach",
+                                      "release-force", "release-force"]
+    assert table.morphology.tolist() == ["sharp", "gradual", "gradual", "sharp"]
+    assert table.event_label.tolist() == ["detach", "attach", "release", "force"]
 
 
 def test_delta_uses_edge_signal_endpoints_without_stable_plateaus():
@@ -402,39 +448,69 @@ def _extrema_from_steps(steps, peak_k=10, config=None, direction=1):
                                    config=config or ExperimentConfig())[0]
 
 
-def test_extrema_left_reversal_and_second_right_reverse_sample():
+def test_sharp_positive_uses_either_neighbor_and_distinct_side_thresholds():
     steps = np.zeros(30)
-    steps[8:15] = [-.04, .05, .2, .04, -.03, .04, -.03]
+    steps[8:14] = [.01, .02, .2, .12, .02, .01]
     row = _extrema_from_steps(steps)
     assert row["resolved"]
-    assert row["start_idx"] == 9
-    assert row["end_idx"] == 14
-    assert row["start_rule"] == "reversal"
-    assert row["end_rule"] == "second_reversal"
+    assert row["right_mode"] == "positive_sharp"
+    assert (row["start_idx"], row["end_idx"]) == (10, 12)
+    assert (row["start_rule"], row["end_rule"]) == ("threshold", "threshold")
     assert np.isclose(row["threshold_left"], .03)
-    assert np.isclose(row["threshold_right"], .03)
-    steps[13] = -.03
-    row = _extrema_from_steps(steps)
-    assert row["end_idx"] == 13
+    assert np.isclose(row["threshold_right"], .08)
+    assert row["is_sharp"]
 
 
-def test_extrema_single_point_includes_two_same_sign_steps():
+def test_general_edge_uses_three_low_left_and_four_low_right():
     steps = np.zeros(30)
-    steps[8:13] = [.01, .01, .2, .005, .005]
+    steps[6:16] = [.01, .01, .01, .12, .2, .12, .01, .01, .01, .01]
+    positive = _extrema_from_steps(steps)
+    negative = _extrema_from_steps(-steps, direction=-1)
+    for row in (positive, negative):
+        assert row["resolved"]
+        assert (row["start_idx"], row["end_idx"]) == (8, 13)
+        assert (row["threshold_left"], row["threshold_right"]) == (.02, .02)
+        assert not row["is_sharp"]
+
+
+def test_general_edge_stops_before_second_nonconsecutive_reverse_sample():
+    steps = np.zeros(30)
+    steps[6:15] = [-.04, .12, -.04, .12, .2, .12, -.04, .12, -.04]
     row = _extrema_from_steps(steps)
     assert row["resolved"]
-    assert (row["start_idx"], row["end_idx"]) == (8, 11)
-    assert row["start_rule"] == row["end_rule"] == "single_point"
-    negative = _extrema_from_steps(-steps, direction=-1)
-    assert (negative["start_idx"], negative["end_idx"]) == (8, 11)
-    assert negative["start_rule"] == "single_point"
-    steps[8] = -.01
-    ordinary = _extrema_from_steps(steps)
-    assert ordinary["start_rule"] != "single_point"
-    steps[8] = .01
-    steps[12] = .03
-    continued = _extrema_from_steps(steps)
-    assert continued["start_rule"] != "single_point"
+    assert (row["start_idx"], row["end_idx"]) == (7, 14)
+    assert (row["start_rule"], row["end_rule"]) == ("second_reversal", "second_reversal")
+
+
+def test_sharp_left_zero_difference_stops_at_peak_boundary():
+    steps = np.zeros(30)
+    steps[9:14] = [0, .2, .12, .01, .01]
+    row = _extrema_from_steps(steps)
+    assert row["resolved"]
+    assert row["start_idx"] == 10
+    assert row["start_rule"] == "nonpositive"
+
+
+def test_new_threshold_parameters_override_each_mode_independently():
+    sharp_steps = np.zeros(30)
+    sharp_steps[8:14] = [.01, .02, .2, .12, .02, .01]
+    config = ExperimentConfig(threshold_du_sharp_left=4,
+                              threshold_dupeak_sharp_left=.25,
+                              threshold_du_sharp_right=5,
+                              threshold_dupeak_sharp_right=.5)
+    sharp = _extrema_from_steps(sharp_steps, config=config)
+    assert np.isclose(sharp["threshold_left"], .05)
+    assert np.isclose(sharp["threshold_right"], .1)
+
+    general_steps = np.zeros(30)
+    general_steps[6:16] = [.01, .01, .01, .12, .2, .12, .01, .01, .01, .01]
+    config = ExperimentConfig(threshold_du_general_left=4,
+                              threshold_dupeak_general_left=.1,
+                              threshold_du_general_right=3,
+                              threshold_dupeak_general_right=.2)
+    general = _extrema_from_steps(general_steps, config=config)
+    assert np.isclose(general["threshold_left"], .04)
+    assert np.isclose(general["threshold_right"], .04)
 
 
 def test_peak_fallback_selects_mean_centered_extreme():
@@ -446,45 +522,6 @@ def test_peak_fallback_selects_mean_centered_extreme():
         rows = recover_missing_extrema_pairs(values + offset, [], [roi], fs=100,
                                               noise=noise, config=ExperimentConfig())
         assert {row["fallback_peak_idx"] for row in rows} == {4}
-
-
-def test_extrema_right_modes_use_signed_neighbors_and_exact_endpoint_samples():
-    base = np.zeros(30)
-    base[8] = -.04  # A negative neighbor is compared as signed, not absolute.
-    base[9:14] = [.05, .2, .02, .02, .02]
-    sharp = _extrema_from_steps(base)
-    assert sharp["right_mode"] == "positive_isolated"
-    assert sharp["right_quiet_points"] == 2
-    assert np.isclose(sharp["threshold_right"], .03)
-    assert (sharp["end_idx"], sharp["end_rule"]) == (11, "threshold")
-
-    broad = base.copy()
-    broad[9] = .11
-    broad[11:15] = [.01, .01, .01, .01]
-    row = _extrema_from_steps(broad)
-    assert row["right_mode"] == "positive_broad"
-    assert row["right_quiet_points"] == 3
-    assert np.isclose(row["threshold_right"], .02)
-    assert (row["end_idx"], row["end_rule"]) == (12, "threshold")
-
-    negative = _extrema_from_steps(-broad, direction=-1)
-    assert negative["right_mode"] == "negative"
-    assert negative["right_quiet_points"] == 3
-    assert negative["end_idx"] == 12
-
-
-def test_extrema_right_threshold_overrides_and_second_reversal_precedence():
-    steps = np.zeros(30)
-    steps[8:15] = [-.04, .05, .2, .04, -.03, .04, -.03]
-    row = _extrema_from_steps(steps)
-    assert (row["end_idx"], row["end_rule"]) == (14, "second_reversal")
-    isolated = steps.copy()
-    isolated[11:15] = [.02, .02, .02, .02]
-    cfg = ExperimentConfig(threshold_du_rightup=4, threshold_dupeak_rightup=.25)
-    changed = _extrema_from_steps(isolated, config=cfg)
-    assert changed["right_mode"] == "positive_isolated"
-    assert np.isclose(changed["threshold_right"], .05)
-    assert changed["right_quiet_points"] == 2
 
 
 def test_roi_classification_requires_amplitude_matched_qualified_pair():
@@ -524,16 +561,3 @@ def test_fallback_main_pair_controls_roi_classification():
     mismatched = _direct_table(original + fallback, rois)
     assert set(mismatched.classification_status) == {"roi_delta_mismatch"}
     assert mismatched.event_label.isna().all()
-
-
-def test_positive_broad_right_floor_and_neighbor_ratio_are_overridable():
-    steps = np.zeros(30)
-    steps[8:15] = [-.04, .11, .2, .01, .01, .01, .01]
-    base = _extrema_from_steps(steps, config=ExperimentConfig(
-        threshold_du_right=4, threshold_dupeak_right=.01))
-    assert base["right_mode"] == "positive_broad"
-    assert np.isclose(base["threshold_right"], .04)
-    assert base["right_quiet_points"] == 3
-    reclassified = _extrema_from_steps(steps, config=ExperimentConfig(
-        rightup_neighbor_ratio=.6))
-    assert reclassified["right_mode"] == "positive_isolated"
