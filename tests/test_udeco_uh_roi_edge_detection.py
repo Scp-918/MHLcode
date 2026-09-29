@@ -350,6 +350,23 @@ def test_roi_mode_uses_rising_shape_and_keeps_falling_shape_diagnostic():
     assert table.event_label.tolist() == ["detach", "attach", "release", "force"]
 
 
+def test_roi_mode_requires_rising_start_before_falling_start_including_fallback():
+    rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200},
+            {"roi_id": "ROI_1", "left_idx": 201, "right_idx": 300}]
+    fall_first = _direct_edge("ROI_0", 120, -1, delta=-.01)
+    rise_later = _direct_edge("ROI_0", 150, 1, delta=.01, is_sharp=True)
+    fallback_rise = _direct_edge("ROI_1", 250, 1, delta=.01, is_sharp=True)
+    fallback_fall = _direct_edge("ROI_1", 250, -1, delta=-.01)
+    for row in (fallback_rise, fallback_fall):
+        row["detector_name"] = "peak_fallback"
+    fallback_rise["start_idx"] = 220
+    fallback_fall["start_idx"] = 250
+    table = _direct_table([fall_first, rise_later, fallback_rise, fallback_fall], rois)
+    assert table.roi_mode.tolist() == ["release-force", "release-force",
+                                      "detach-attach", "detach-attach"]
+    assert table.event_label.tolist() == ["force", "release", "detach", "attach"]
+
+
 def test_delta_uses_edge_signal_endpoints_without_stable_plateaus():
     edge = np.zeros(2200)
     edge[1800:1807] = np.arange(1, 8) * .001
@@ -451,7 +468,7 @@ def _extrema_from_steps(steps, peak_k=10, config=None, direction=1):
 def test_sharp_positive_uses_either_neighbor_and_distinct_side_thresholds():
     steps = np.zeros(30)
     steps[8:14] = [.01, .02, .2, .12, .02, .01]
-    row = _extrema_from_steps(steps)
+    row = _extrema_from_steps(steps, config=ExperimentConfig(sharp_peak_sigma_k=10))
     assert row["resolved"]
     assert row["right_mode"] == "positive_sharp"
     assert (row["start_idx"], row["end_idx"]) == (10, 12)
@@ -485,16 +502,48 @@ def test_general_edge_stops_before_second_nonconsecutive_reverse_sample():
 def test_sharp_left_zero_difference_stops_at_peak_boundary():
     steps = np.zeros(30)
     steps[9:14] = [0, .2, .12, .01, .01]
-    row = _extrema_from_steps(steps)
+    row = _extrema_from_steps(steps, config=ExperimentConfig(sharp_peak_sigma_k=10))
     assert row["resolved"]
     assert row["start_idx"] == 10
-    assert row["start_rule"] == "nonpositive"
+    assert row["start_rule"] == "nonpositive_adjacent"
+
+
+def test_sharp_four_neighbors_and_strict_baseline_peak_floor():
+    steps = np.zeros(30)
+    steps[8:13] = [.01, .2, .4, .01, .01]
+    one_strong = _extrema_from_steps(steps)
+    assert one_strong["is_sharp"]
+    assert one_strong["strong_neighbor_count"] == 1
+    assert one_strong["right_mode"] == "positive_sharp"
+    assert _extrema_from_steps(-steps, direction=-1)["is_sharp"]
+
+    steps[8] = .2
+    two_strong = _extrema_from_steps(steps)
+    assert not two_strong["is_sharp"]
+    assert two_strong["strong_neighbor_count"] == 2
+
+    steps[8:13] = [.01, .01, .3, .01, .01]
+    assert not _extrema_from_steps(steps)["is_sharp"]
+    steps[10] = .31
+    assert _extrema_from_steps(steps)["is_sharp"]
+
+
+def test_sharp_nonpositive_start_uses_plot_aligned_adjacent_or_next_point():
+    adjacent = np.zeros(30)
+    adjacent[9:13] = [-.01, .4, .01, .01]
+    row = _extrema_from_steps(adjacent)
+    assert (row["start_idx"], row["start_rule"]) == (10, "nonpositive_adjacent")
+
+    nonadjacent = adjacent.copy()
+    nonadjacent[8:10] = [-.01, .005]
+    row = _extrema_from_steps(nonadjacent)
+    assert (row["start_idx"], row["start_rule"]) == (10, "nonpositive_nonadjacent")
 
 
 def test_new_threshold_parameters_override_each_mode_independently():
     sharp_steps = np.zeros(30)
     sharp_steps[8:14] = [.01, .02, .2, .12, .02, .01]
-    config = ExperimentConfig(threshold_du_sharp_left=4,
+    config = ExperimentConfig(sharp_peak_sigma_k=10, threshold_du_sharp_left=4,
                               threshold_dupeak_sharp_left=.25,
                               threshold_du_sharp_right=5,
                               threshold_dupeak_sharp_right=.5)

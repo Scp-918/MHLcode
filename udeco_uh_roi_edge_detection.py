@@ -44,7 +44,8 @@ class ExperimentConfig:
     threshold_dupeak_general_left: float = 0.08
     threshold_du_general_right: float = 2.0
     threshold_dupeak_general_right: float = 0.08
-    sharp_neighbor_ratio: float = 0.5
+    sharp_neighbor_ratio: float = 0.4
+    sharp_peak_sigma_k: float = 30.0
     delta_mismatch_fraction: float = 0.5
     deriv_peak_width_threshold_sec: float = 0.04
     deriv_peak_sigma_k: float = 5.0
@@ -298,12 +299,14 @@ def _unresolved(candidate: dict, reason: str, **measurements) -> dict:
 
 
 def _sharp_peak(derivative: np.ndarray, peak_k: int, direction: int,
-                neighbor_ratio: float) -> bool:
+                neighbor_ratio: float, sigma_du: float,
+                peak_sigma_k: float) -> tuple[bool, int]:
     peak_size = direction * derivative[peak_k]
-    neighbors = [direction * derivative[k] for k in (peak_k - 1, peak_k + 1)
+    neighbors = [direction * derivative[k]
+                 for k in (peak_k - 2, peak_k - 1, peak_k + 1, peak_k + 2)
                  if 0 <= k < len(derivative)]
-    return bool(neighbors) and not all(value > neighbor_ratio * peak_size
-                                       for value in neighbors)
+    strong_count = sum(value > neighbor_ratio * peak_size for value in neighbors)
+    return peak_size > peak_sigma_k * sigma_du and strong_count <= 1, strong_count
 
 
 def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
@@ -346,7 +349,9 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                                       derivative_peak_idx=peak_k + 1,
                                       derivative_peak=peak))
             continue
-        is_sharp = _sharp_peak(derivative, peak_k, direction, config.sharp_neighbor_ratio)
+        is_sharp, strong_neighbor_count = _sharp_peak(
+            derivative, peak_k, direction, config.sharp_neighbor_ratio,
+            noise["sigma_du"], config.sharp_peak_sigma_k)
         sharp_positive = direction > 0 and is_sharp
         mode = "sharp" if sharp_positive else "general"
         threshold_left = max(getattr(config, f"threshold_du_{mode}_left") * noise["sigma_du"],
@@ -365,7 +370,9 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
         reverse_count = 0
         for k in range(peak_k - 1, left - 1, -1):
             if sharp_positive and derivative[k] <= 0:
-                start_idx, start_rule = k + 1, "nonpositive"
+                adjacent = k == peak_k - 1
+                start_idx = k + 1 if adjacent else k + 2
+                start_rule = "nonpositive_adjacent" if adjacent else "nonpositive_nonadjacent"
                 break
             if not sharp_positive and direction * derivative[k] < 0:
                 reverse_count += 1
@@ -383,7 +390,8 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                                       derivative_peak=peak, core_threshold=core_threshold,
                                       threshold_left=threshold_left, threshold_right=threshold_right,
                                       right_mode=right_mode, left_quiet_points=left_quiet_points,
-                                      right_quiet_points=right_quiet_points, is_sharp=is_sharp))
+                                      right_quiet_points=right_quiet_points, is_sharp=is_sharp,
+                                      strong_neighbor_count=strong_neighbor_count))
             continue
         low_run = 0
         reverse_count = 0
@@ -405,6 +413,7 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                    "threshold_left": threshold_left, "threshold_right": threshold_right,
                    "right_mode": right_mode, "left_quiet_points": left_quiet_points,
                    "right_quiet_points": right_quiet_points, "is_sharp": is_sharp,
+                   "strong_neighbor_count": strong_neighbor_count,
                    "start_rule": start_rule, "end_rule": end_rule}
         if end_idx is None:
             result.append(_unresolved(candidate, "core_does_not_end", **partial))
@@ -563,8 +572,9 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
             relative_peak = int(np.argmax(direction * local_derivative))
             peak_idx = start + 1 + relative_peak
             derivative_peak = float(derivative[peak_idx])
-            is_sharp = _sharp_peak(np.diff(values), peak_idx - 1, direction,
-                                   config.sharp_neighbor_ratio)
+            is_sharp, strong_neighbor_count = _sharp_peak(
+                np.diff(values), peak_idx - 1, direction, config.sharp_neighbor_ratio,
+                noise["sigma_du"], config.sharp_peak_sigma_k)
             half_peak = abs(derivative_peak) / 2
             width_left = peak_idx
             while width_left > start + 1 and direction * derivative[width_left - 1] >= half_peak:
@@ -577,6 +587,7 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
                            "amplitude": abs(delta), "T_edge": (end - start) / fs,
                            "derivative_peak_idx": peak_idx, "derivative_peak": derivative_peak,
                            "is_sharp": is_sharp,
+                           "strong_neighbor_count": strong_neighbor_count,
                            "core_threshold": max(config.threshold_du_general_left * noise["sigma_du"],
                                                  config.threshold_dupeak_general_left * abs(derivative_peak)),
                            "normalized_derivative_peak": abs(derivative_peak) / max(noise["sigma_du"], np.finfo(float).eps),
@@ -657,8 +668,9 @@ def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel
             table.loc[selected, "classification_status"] = classification_status
         else:
             rising_sharp = bool(rising.iloc[0].get("is_sharp", False))
-            roi_shape = "sharp" if rising_sharp else "gradual"
-            table.loc[selected, "roi_mode"] = ("detach-attach" if rising_sharp
+            rising_first = int(rising.iloc[0].start_idx) < int(falling.iloc[0].start_idx)
+            roi_shape = "sharp" if rising_sharp and rising_first else "gradual"
+            table.loc[selected, "roi_mode"] = ("detach-attach" if roi_shape == "sharp"
                                                  else "release-force")
             for index, item in qualified.iterrows():
                 table.at[index, "morphology"] = "sharp" if bool(item.get("is_sharp", False)) else "gradual"
