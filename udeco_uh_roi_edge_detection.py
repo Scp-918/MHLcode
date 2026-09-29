@@ -40,8 +40,8 @@ class ExperimentConfig:
     candidate_merge_sec: float = 0.02
     localize_search_sec: float = 0.20
     extrema_trace_sec: float = 1.0
-    deriv_core_ratio: float = 0.20
-    deriv_sigma_k: float = 3.0
+    deriv_core_ratio: float = 0.15
+    deriv_sigma_k: float = 2.0
     core_end_min_points: int = 2
     sharp_edge_duration_sec: float = 0.05
     deriv_peak_width_threshold_sec: float = 0.04

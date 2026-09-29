@@ -281,7 +281,7 @@ def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
     assert measured["resolved"]
     assert measured["start_idx"] == 1848
     assert measured["end_idx"] > roi["right_idx"] + 20
-    assert np.isclose(measured["core_threshold"], 0.0004)
+    assert np.isclose(measured["core_threshold"], 0.0003)
 
 
 def test_localization_can_start_before_left_search_boundary():
@@ -466,7 +466,7 @@ def test_extrema_localization_keeps_roi_anchor_when_stronger_peak_is_outside():
     measured = localize_roi_candidates(signal, signal, candidates, [roi], fs=100,
                                        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=cfg)[0]
     assert measured["derivative_peak_idx"] == 1800
-    assert np.isclose(measured["core_threshold"], .002)
+    assert np.isclose(measured["core_threshold"], .0015)
 
 
 def test_overlapping_extrema_split_at_quietest_derivative_and_remeasure():
