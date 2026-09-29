@@ -395,7 +395,7 @@ def test_direct_selection_displays_both_extrema_without_position_pair_gate():
         _direct_edge("ROI_0", 180, -1, resolved=False)], rois)
     assert table.is_main_rising.tolist() == [True, False]
     assert table.is_main_falling.tolist() == [False, True]
-    assert table.pair_status.tolist() == ["both_detected", "both_detected"]
+    assert table.pair_status.tolist() == ["unpaired", "unpaired"]
     assert table.event_label.tolist() == ["detach", None]
     assert table.classification_status.tolist() == ["classified", "localization_failed"]
 
@@ -406,7 +406,7 @@ def test_direct_classification_uses_strict_absolute_delta_and_flags_sign_conflic
     table = _direct_table([
         _direct_edge("ROI_0", 150, 1, delta=0.0002),
         _direct_edge("ROI_1", 250, 1, delta=-0.0003)], rois)
-    assert table.pair_status.tolist() == ["missing_direction", "missing_direction"]
+    assert table.pair_status.tolist() == ["unpaired", "unpaired"]
     assert table.event_label.tolist() == [None, "detach"]
     assert table.classification_status.tolist() == ["low_amplitude", "classified"]
     assert table.direction_delta_conflict.tolist() == [False, True]
@@ -521,3 +521,77 @@ def test_weak_peak_and_unfinished_edge_keep_failure_reason():
     unfinished = localize_roi_candidates(rising, rising, [{**candidate, "center_idx": 1801}], [roi], fs=100,
                                          noise=noise, config=ExperimentConfig(extrema_trace_sec=.1))[0]
     assert unfinished["reason"] == "core_does_not_end"
+
+
+def test_left_start_requires_two_quiet_differences_and_threshold_override():
+    signal = np.zeros(2200)
+    signal[1798:] += .0001
+    signal[1799:] += .001
+    signal[1800:] += .01
+    roi = {"roi_id": "ROI_0", "left_idx": 1790, "right_idx": 1820}
+    candidate = {"roi_id": "ROI_0", "center_idx": 1800, "direction": 1,
+                 "detector_name": "derivative_extrema"}
+    cfg = ExperimentConfig(threshold_du=2, threshold_dupeak=.15)
+    row = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
+                                  noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=cfg)[0]
+    assert row["resolved"]
+    assert row["start_idx"] == 1799
+    assert np.isclose(row["core_threshold"], .0015)
+    stronger_floor = ExperimentConfig(threshold_du=200, threshold_dupeak=.15)
+    weak = localize_roi_candidates(signal, signal, [candidate], [roi], fs=100,
+                                   noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4},
+                                   config=stronger_floor)[0]
+    assert weak["reason"] == "weak_derivative"
+
+
+def test_peak_fallback_positive_and_negative_turn_beyond_roi():
+    from udeco_uh_roi_edge_detection import recover_missing_extrema_pairs
+    positive = np.zeros(100)
+    positive[18] = .02
+    positive[20:30] = np.arange(1, 11) * .01
+    positive[30:40] = np.arange(9, -1, -1) * .01
+    positive[40] = .02
+    roi = {"roi_id": "ROI_0", "left_idx": 23, "search_left_idx": 22,
+           "right_idx": 35}
+    noise = {"sigma_udeco": 1e-4, "sigma_du": 1e-4}
+    for signal, directions in ((positive, (1, -1)), (-positive, (-1, 1))):
+        rows = recover_missing_extrema_pairs(signal, [], [roi], fs=100,
+                                              noise=noise, config=ExperimentConfig())
+        assert len(rows) == 2
+        assert [row["direction"] for row in rows] == list(directions)
+        assert [(row["start_idx"], row["end_idx"]) for row in rows] == [(19, 29), (29, 39)]
+        assert all(row["endpoint_source"] == "turn" for row in rows)
+        assert rows[0]["start_idx"] < roi["search_left_idx"]
+        assert rows[1]["end_idx"] > roi["right_idx"]
+
+
+def test_fallback_search_limit_and_main_pair_switch():
+    from udeco_uh_roi_edge_detection import recover_missing_extrema_pairs
+    signal = np.zeros(100)
+    signal[20:31] = np.arange(1, 12) * .01
+    signal[31:] = signal[30]
+    roi = {"roi_id": "ROI_0", "left_idx": 24, "search_left_idx": 22,
+           "right_idx": 33}
+    noise = {"sigma_udeco": 1e-4, "sigma_du": 1e-4}
+    rows = recover_missing_extrema_pairs(signal, [], [roi], fs=100,
+                                          noise=noise, config=ExperimentConfig(extrema_trace_sec=.1))
+    assert rows[0]["search_limit"] and rows[0]["resolved"]
+    assert rows[1]["search_limit"] and not rows[1]["resolved"]
+    original = [_direct_edge("ROI_0", 25, 1, delta=.01),
+                _direct_edge("ROI_0", 32, -1, resolved=False)]
+    positive = np.zeros(100)
+    positive[18] = .02
+    positive[20:30] = np.arange(1, 11) * .01
+    positive[30:40] = np.arange(9, -1, -1) * .01
+    positive[40] = .02
+    recovered = recover_missing_extrema_pairs(positive, original, [roi], fs=100,
+                                               noise=noise, config=ExperimentConfig())
+    table = _direct_table(recovered, [roi])
+    assert table.loc[table.detector_name == "peak_fallback", "is_main_rising"].any()
+    assert table.loc[table.detector_name == "peak_fallback", "is_main_falling"].any()
+    assert not table.loc[table.detector_name == "derivative_extrema", "is_main_rising"].any()
+    assert set(table.pair_status) == {"fallback_localized"}
+    complete = [_direct_edge("ROI_0", 25, 1, delta=.01),
+                _direct_edge("ROI_0", 32, -1, delta=-.01)]
+    assert len(recover_missing_extrema_pairs(positive, complete, [roi], fs=100,
+                                             noise=noise, config=ExperimentConfig())) == 2
