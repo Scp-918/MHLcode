@@ -35,7 +35,7 @@ class ExperimentConfig:
     candidate_merge_sec: float = 0.02
     localize_search_sec: float = 0.20
     extrema_trace_sec: float = 1.0
-    extrema_entry_sigma_k: float = 10.0
+    extrema_entry_sigma_k: float = 5.0
     threshold_du: float = 2.0
     threshold_du_sharp_left: float = 2.0
     threshold_dupeak_sharp_left: float = 0.15
@@ -276,6 +276,39 @@ def _derivative_extrema_candidates(score: np.ndarray, roi: dict) -> list[dict]:
     return candidates
 
 
+def _threshold_regions(score: np.ndarray, roi: dict, direction: int,
+                       threshold: float) -> list[dict]:
+    """Group signed supra-threshold samples with at most one gap per region."""
+    lo = roi.get("search_left_idx", roi["left_idx"])
+    hi = roi["right_idx"]
+    regions = []
+    start = last_good = None
+    gaps = 0
+
+    def add_region():
+        indices = np.arange(start, last_good + 1)
+        center = int(indices[np.argmax(direction * score[indices])])
+        regions.append({"roi_id": roi["roi_id"], "direction": direction,
+                        "region_start_idx": start, "region_end_idx": last_good,
+                        "center_idx": center, "detector_score": float(abs(score[center])),
+                        "selected": False})
+
+    for index in range(lo, hi + 1):
+        if direction * score[index] > threshold:
+            if start is None:
+                start = index
+            last_good = index
+        elif start is not None:
+            gaps += 1
+            if gaps == 2:
+                add_region()
+                start = last_good = None
+                gaps = 0
+    if start is not None:
+        add_region()
+    return regions
+
+
 def detect_roi_candidates(edge_signal: np.ndarray, rois: list[dict], *, fs: float,
                           config: ExperimentConfig) -> tuple[list[dict], dict]:
     """Find signed derivative extrema within Uh ROIs using fixed baseline noise."""
@@ -288,16 +321,35 @@ def detect_roi_candidates(edge_signal: np.ndarray, rois: list[dict], *, fs: floa
     sigma_du = float(np.std(np.diff(values[:baseline_n])))
     score = derivative / max(sigma_du, np.finfo(float).eps)
     candidates = []
+    all_regions = []
     for roi in rois:
-        roi_candidates = _derivative_extrema_candidates(score, roi)
-        enters = any(row["detector_score"] > config.extrema_entry_sigma_k
-                     for row in roi_candidates)
+        regions = [region for direction in (1, -1)
+                   for region in _threshold_regions(
+                       score, roi, direction, config.extrema_entry_sigma_k)]
+        enters = bool(regions)
+        if enters:
+            roi_candidates = []
+            for direction in (1, -1):
+                choices = [region for region in regions if region["direction"] == direction]
+                if not choices:
+                    continue
+                chosen = min(choices, key=lambda region: (
+                    abs(region["center_idx"] - roi["main_peak_idx"]),
+                    -region["detector_score"], region["center_idx"]))
+                chosen["selected"] = True
+                roi_candidates.append({key: value for key, value in chosen.items()
+                                       if key != "selected"})
+        else:
+            roi_candidates = _derivative_extrema_candidates(score, roi)
         for row in roi_candidates:
             row["candidate_direction"] = row["direction"]
             row["extrema_entry_pass"] = enters
+            row["detector_name"] = "derivative_extrema"
         candidates.extend(roi_candidates)
+        all_regions.extend(regions)
     diagnostics = {"derivative_signal": derivative, "derivative_score": score,
-                   "derivative_sigma": sigma_du, "detector_name": "derivative_extrema"}
+                   "derivative_sigma": sigma_du, "detector_name": "derivative_extrema",
+                   "regions": all_regions}
     return sorted(candidates, key=lambda item: (item["roi_id"], item["center_idx"])), diagnostics
 
 

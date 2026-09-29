@@ -132,7 +132,7 @@ def test_udeco_detection_extends_only_the_left_side_of_logical_roi():
     signal = np.zeros(2500)
     signal[1798:1820] = 0.01
     roi = {"roi_id": "ROI_0", "left_idx": 1800, "right_idx": 1850,
-           "search_left_idx": 1797}
+           "search_left_idx": 1797, "main_peak_idx": 1810}
     candidates, _ = detect_roi_candidates(signal, [roi], fs=100,
                                           config=ExperimentConfig())
     assert any(candidate["direction"] == 1 and candidate["center_idx"] < 1800
@@ -147,7 +147,7 @@ def test_derivative_extrema_selects_one_signed_boundary_per_roi():
     signal[1798:1820] = 0.01
     signal[1851:] = 0.05  # Larger edge just outside the ROI must be ignored.
     roi = {"roi_id": "ROI_0", "left_idx": 1800, "search_left_idx": 1797,
-           "right_idx": 1850}
+           "right_idx": 1850, "main_peak_idx": 1810}
 
     candidates, diagnostics = detect_roi_candidates(
         signal, [roi], fs=100,
@@ -163,12 +163,13 @@ def test_derivative_extrema_selects_one_signed_boundary_per_roi():
     assert np.isclose(candidates[0]["detector_score"], 0.01 / sigma_du)
 
 
-def test_derivative_extrema_keeps_only_available_direction_without_score_gate():
+def test_below_gate_extremum_remains_available_for_diagnostics():
     rng = np.random.default_rng(24)
     signal = np.zeros(2500)
     signal[:1500] = rng.normal(0, 1e-4, 1500)
     signal[1800:1860] = np.arange(60) * 1e-5
-    roi = {"roi_id": "ROI_0", "left_idx": 1801, "right_idx": 1850}
+    roi = {"roi_id": "ROI_0", "left_idx": 1801, "right_idx": 1850,
+           "main_peak_idx": 1820}
 
     candidates, _ = detect_roi_candidates(
         signal, [roi], fs=100,
@@ -179,23 +180,23 @@ def test_derivative_extrema_keeps_only_available_direction_without_score_gate():
     assert candidates[0]["detector_score"] < 3.0
 
 
-def test_extrema_entry_uses_strict_ten_sigma_and_either_direction():
+def test_extrema_entry_uses_strict_five_sigma_and_either_direction():
     from udeco_uh_roi_edge_detection import recover_missing_extrema_pairs
 
     noise = {"sigma_udeco": .5, "sigma_du": 1.0}
     roi = {"roi_id": "ROI_0", "left_idx": 118, "search_left_idx": 117,
-           "right_idx": 130}
-    for peak, enters in ((10.0, False), (11.0, True)):
+           "right_idx": 130, "main_peak_idx": 122}
+    for peak, enters in ((5.0, False), (6.0, True)):
         signal = np.zeros(160)
         signal[:11] = [0, 1] * 5 + [0]  # Ten alternating differences: sigma_du = 1.
         signal[120:125] = peak
-        signal[125:] = peak - 3  # Only the rising extremum can exceed 10 sigma.
+        signal[125:] = peak - 3  # Only the rising extremum can exceed 5 sigma.
         candidates, _ = detect_roi_candidates(
             signal, [roi], fs=100,
-            config=ExperimentConfig(baseline_sec=.11, extrema_entry_sigma_k=10))
+            config=ExperimentConfig(baseline_sec=.11))
         rows = localize_roi_candidates(
             signal, signal, candidates, [roi], fs=100, noise=noise,
-            config=ExperimentConfig(extrema_entry_sigma_k=10))
+            config=ExperimentConfig())
         assert all(row.get("extrema_entry_pass") is enters for row in rows)
         if not enters:
             assert all(row["reason"] == "below_extrema_entry_threshold" for row in rows)
@@ -205,6 +206,79 @@ def test_extrema_entry_uses_strict_ten_sigma_and_either_direction():
             assert any(row["detector_name"] == "peak_fallback" for row in recovered)
         else:
             assert any(row.get("right_mode") for row in rows)
+            assert [row["direction"] for row in candidates] == [1]
+
+
+def _five_sigma_region_signal(changes):
+    signal = np.zeros(180)
+    signal[:11] = [0, 1] * 5 + [0]  # Baseline sigma_du = 1.
+    increments = np.zeros(80)
+    for center, value in changes.items():
+        increments[center - 100] = value
+    signal[100:] = np.cumsum(increments)
+    return signal
+
+
+def test_nearest_uh_peak_region_wins_independently_for_each_direction():
+    signal = _five_sigma_region_signal({106: 20, 118: 7, 123: -8, 134: -20})
+    roi = {"roi_id": "ROI_0", "left_idx": 100, "search_left_idx": 100,
+           "right_idx": 140, "main_peak_idx": 120}
+    candidates, diagnostics = detect_roi_candidates(
+        signal, [roi], fs=100, config=ExperimentConfig(baseline_sec=.11))
+    assert [(row["center_idx"], row["direction"]) for row in candidates] == [
+        (118, 1), (123, -1)]
+    assert [(row["region_start_idx"], row["region_end_idx"]) for row in candidates] == [
+        (118, 118), (123, 123)]
+    regions = diagnostics["regions"]
+    assert sum(row["direction"] == 1 for row in regions) == 2
+    assert sum(row["direction"] == -1 for row in regions) == 2
+    assert {row["center_idx"] for row in regions if row["selected"]} == {118, 123}
+
+
+def test_region_single_gap_can_reverse_sign_but_second_gap_splits_it():
+    signal = _five_sigma_region_signal(
+        {110: 8, 111: 9, 112: -8, 113: 7, 116: 6})
+    roi = {"roi_id": "ROI_0", "left_idx": 100, "right_idx": 140,
+           "main_peak_idx": 111}
+    candidates, diagnostics = detect_roi_candidates(
+        signal, [roi], fs=100, config=ExperimentConfig(baseline_sec=.11))
+    positives = [row for row in diagnostics["regions"] if row["direction"] == 1]
+    assert [(row["region_start_idx"], row["region_end_idx"]) for row in positives] == [
+        (110, 113), (116, 116)]
+    chosen = next(row for row in candidates if row["direction"] == 1)
+    assert (chosen["center_idx"], chosen["region_start_idx"], chosen["region_end_idx"]) == (
+        111, 110, 113)
+
+    signal = _five_sigma_region_signal({110: 8, 111: -1, 112: 8,
+                                        113: 0, 114: 9})
+    _, diagnostics = detect_roi_candidates(
+        signal, [roi], fs=100, config=ExperimentConfig(baseline_sec=.11))
+    positives = [row for row in diagnostics["regions"] if row["direction"] == 1]
+    assert [(row["region_start_idx"], row["region_end_idx"]) for row in positives] == [
+        (110, 112), (114, 114)]
+
+
+def test_region_tie_uses_stronger_peak_then_earlier_time_and_missing_sign_falls_back():
+    from udeco_uh_roi_edge_detection import recover_missing_extrema_pairs
+
+    roi = {"roi_id": "ROI_0", "left_idx": 100, "right_idx": 140,
+           "main_peak_idx": 120}
+    signal = _five_sigma_region_signal({119: 7, 121: 8})
+    candidates, _ = detect_roi_candidates(
+        signal, [roi], fs=100, config=ExperimentConfig(baseline_sec=.11))
+    assert [(row["center_idx"], row["direction"]) for row in candidates] == [(121, 1)]
+    localized = localize_roi_candidates(
+        signal, signal, candidates, [roi], fs=100,
+        noise={"sigma_udeco": .5, "sigma_du": 1}, config=ExperimentConfig())
+    recovered = recover_missing_extrema_pairs(
+        signal, localized, [roi], fs=100,
+        noise={"sigma_udeco": .5, "sigma_du": 1}, config=ExperimentConfig())
+    assert sum(row["detector_name"] == "peak_fallback" for row in recovered) == 2
+
+    signal = _five_sigma_region_signal({119: 8, 121: 8})
+    candidates, _ = detect_roi_candidates(
+        signal, [roi], fs=100, config=ExperimentConfig(baseline_sec=.11))
+    assert candidates[0]["center_idx"] == 119
 
 
 def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
@@ -213,7 +287,8 @@ def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
     steps[1848] = .0006
     signal = np.cumsum(steps)
     roi = {"roi_id": "ROI_0", "left_idx": 1800,
-           "search_left_idx": 1797, "right_idx": 1850}
+           "search_left_idx": 1797, "right_idx": 1850,
+           "main_peak_idx": 1848}
     candidates, _ = detect_roi_candidates(
         signal, [roi], fs=100,
         config=ExperimentConfig())
@@ -305,7 +380,8 @@ def test_extrema_localization_keeps_roi_anchor_when_stronger_peak_is_outside():
     signal = np.zeros(2200)
     signal[1800:] = .01
     signal[1810:] += .02
-    roi = {"roi_id": "ROI_0", "left_idx": 1798, "search_left_idx": 1797, "right_idx": 1801}
+    roi = {"roi_id": "ROI_0", "left_idx": 1798, "search_left_idx": 1797,
+           "right_idx": 1801, "main_peak_idx": 1800}
     cfg = ExperimentConfig()
     candidates, _ = detect_roi_candidates(signal, [roi], fs=100, config=cfg)
     measured = localize_roi_candidates(signal, signal, candidates, [roi], fs=100,
@@ -413,7 +489,7 @@ def test_delta_uses_final_edge_range_and_endpoint_direction_without_plateaus():
     edge[1800:1807] = np.arange(1, 8) * .001
     edge[1807:1814] = .007 - np.arange(1, 8) * .001
     roi = {"roi_id": "ROI_0", "left_idx": 1795, "search_left_idx": 1792,
-           "right_idx": 1815}
+           "right_idx": 1815, "main_peak_idx": 1806}
     cfg = ExperimentConfig()
     candidates, _ = detect_roi_candidates(edge, [roi], fs=100, config=cfg)
     # The clean trace has a different scale; delta must use edge_signal.
