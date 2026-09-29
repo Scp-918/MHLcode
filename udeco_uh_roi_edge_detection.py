@@ -35,6 +35,7 @@ class ExperimentConfig:
     candidate_merge_sec: float = 0.02
     localize_search_sec: float = 0.20
     extrema_trace_sec: float = 1.0
+    extrema_entry_sigma_k: float = 10.0
     threshold_du: float = 2.0
     threshold_du_sharp_left: float = 2.0
     threshold_dupeak_sharp_left: float = 0.15
@@ -286,8 +287,15 @@ def detect_roi_candidates(edge_signal: np.ndarray, rois: list[dict], *, fs: floa
     derivative[1:] = np.diff(values)
     sigma_du = float(np.std(np.diff(values[:baseline_n])))
     score = derivative / max(sigma_du, np.finfo(float).eps)
-    candidates = [candidate for roi in rois
-                  for candidate in _derivative_extrema_candidates(score, roi)]
+    candidates = []
+    for roi in rois:
+        roi_candidates = _derivative_extrema_candidates(score, roi)
+        enters = any(row["detector_score"] > config.extrema_entry_sigma_k
+                     for row in roi_candidates)
+        for row in roi_candidates:
+            row["candidate_direction"] = row["direction"]
+            row["extrema_entry_pass"] = enters
+        candidates.extend(roi_candidates)
     diagnostics = {"derivative_signal": derivative, "derivative_score": score,
                    "derivative_sigma": sigma_du, "detector_name": "derivative_extrema"}
     return sorted(candidates, key=lambda item: (item["roi_id"], item["center_idx"])), diagnostics
@@ -309,31 +317,61 @@ def _sharp_peak(derivative: np.ndarray, peak_k: int, direction: int,
     return peak_size > peak_sigma_k * sigma_du and strong_count <= 1, strong_count
 
 
+def _measure_resolved_edge(row: dict, edge_signal: np.ndarray, *, fs: float,
+                           noise: dict[str, float], config: ExperimentConfig) -> None:
+    """Measure morphology from the final start/end interval, after any split."""
+    start, end = int(row["start_idx"]), int(row["end_idx"])
+    if end <= start:
+        row.update(resolved=False, reason="invalid_edge_bounds")
+        return
+    segment = edge_signal[start:end + 1]
+    endpoint_change = float(segment[-1] - segment[0])
+    direction = int(np.sign(endpoint_change))
+    if direction == 0:
+        row.update(resolved=False, reason="zero_endpoint_change")
+        return
+    if row["detector_name"] == "derivative_extrema":
+        row.setdefault("candidate_direction", row["direction"])
+    steps = np.diff(edge_signal)
+    peak_k = start + int(np.argmax(direction * steps[start:end]))
+    peak = float(steps[peak_k])
+    half_peak = direction * peak / 2
+    fwhm_left = peak_k
+    while fwhm_left > start and direction * steps[fwhm_left - 1] >= half_peak:
+        fwhm_left -= 1
+    fwhm_right = peak_k
+    while fwhm_right < end - 1 and direction * steps[fwhm_right + 1] >= half_peak:
+        fwhm_right += 1
+    is_sharp, strong_count = _sharp_peak(
+        steps, peak_k, direction, config.sharp_neighbor_ratio,
+        noise["sigma_du"], config.sharp_peak_sigma_k)
+    delta = float(np.max(segment) - np.min(segment))
+    row.update(direction=direction, resolved=True, reason=None,
+               endpoint_change=endpoint_change, delta=delta, amplitude=delta,
+               T_edge=(end - start) / fs,
+               derivative_peak_idx=peak_k + 1, derivative_peak=peak,
+               normalized_derivative_peak=abs(peak) / max(noise["sigma_du"], np.finfo(float).eps),
+               derivative_peak_width=(fwhm_right - fwhm_left + 1) / fs,
+               derivative_fwhm_left_idx=fwhm_left,
+               derivative_fwhm_right_idx=fwhm_right + 1,
+               is_sharp=is_sharp, strong_neighbor_count=strong_count,
+               monotonicity=float(np.mean(direction * steps[start:end]
+                                          >= -config.threshold_du * noise["sigma_du"])),
+               baseline_snr=delta / max(noise["sigma_udeco"], np.finfo(float).eps))
+
+
 def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                             candidates: list[dict], rois: list[dict], *, fs: float,
                             noise: dict[str, float], config: ExperimentConfig) -> list[dict]:
     """Locate each complete edge on clean-minus-context; no plateau is required."""
     edge_signal = np.asarray(edge_signal, dtype=float)
     derivative = np.diff(edge_signal)
-    roi_by_id = {roi["roi_id"]: roi for roi in rois}
     radius = max(1, round(config.localize_search_sec * fs))
-    neighbor_bounds = {}
-    for roi_id in roi_by_id:
-        ordered = sorted((i for i, row in enumerate(candidates) if row["roi_id"] == roi_id),
-                         key=lambda i: candidates[i]["center_idx"])
-        for position, i in enumerate(ordered):
-            center = int(candidates[i]["center_idx"])
-            trace_radius = max(radius, round(config.extrema_trace_sec * fs))
-            outer_left = max(0, center - trace_radius)
-            outer_right = min(len(edge_signal) - 1, center + trace_radius)
-            left = ((int(candidates[ordered[position-1]]["center_idx"]) + center) // 2
-                    if position else outer_left)
-            right = ((center + int(candidates[ordered[position+1]]["center_idx"])) // 2
-                     if position + 1 < len(ordered) else outer_right)
-            neighbor_bounds[i] = (left, right)
     result = []
-    for candidate_index, candidate in enumerate(candidates):
-        search_left, search_right = neighbor_bounds[candidate_index]
+    for candidate in candidates:
+        if not candidate.get("extrema_entry_pass", True):
+            result.append(_unresolved(candidate, "below_extrema_entry_threshold"))
+            continue
         center = int(candidate["center_idx"])
         direction = int(candidate["direction"])
         trace_radius = max(radius, round(config.extrema_trace_sec * fs))
@@ -376,8 +414,8 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                 break
             if not sharp_positive and direction * derivative[k] < 0:
                 reverse_count += 1
-                if reverse_count == 2:
-                    start_idx, start_rule = k + 1, "second_reversal"
+                if reverse_count == 3:
+                    start_idx, start_rule = k + 1, "third_reversal"
                     break
             low_run = low_run + 1 if abs(derivative[k]) < threshold_left else 0
             if low_run >= left_quiet_points:
@@ -398,8 +436,8 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
         for k in range(peak_k + 1, right):
             if not sharp_positive and direction * derivative[k] < 0:
                 reverse_count += 1
-                if reverse_count == 2:
-                    end_idx, end_rule = k, "second_reversal"
+                if reverse_count == 3:
+                    end_idx, end_rule = k, "third_reversal"
                     break
             low_run = low_run + 1 if abs(derivative[k]) < threshold_right else 0
             if low_run >= right_quiet_points:
@@ -421,25 +459,8 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
         if end_idx <= start_idx:
             result.append(_unresolved(candidate, "invalid_edge_bounds", **partial))
             continue
-        half_peak = abs(peak) / 2
-        fwhm_left = peak_k
-        while fwhm_left > left and direction * derivative[fwhm_left-1] >= half_peak:
-            fwhm_left -= 1
-        fwhm_right = peak_k
-        while fwhm_right < right-1 and direction * derivative[fwhm_right+1] >= half_peak:
-            fwhm_right += 1
-        delta = float(edge_signal[end_idx] - edge_signal[start_idx])
-        signed_steps = direction * derivative[start_idx:end_idx]
         result.append({**candidate, **partial, "resolved": True, "reason": None,
-                       "endpoint_source": "threshold", "search_limit": False,
-                       "delta": delta, "amplitude": abs(delta),
-                       "T_edge": (end_idx - start_idx) / fs,
-                       "normalized_derivative_peak": abs(peak) / max(noise["sigma_du"], np.finfo(float).eps),
-                       "derivative_peak_width": (fwhm_right - fwhm_left + 1) / fs,
-                       "derivative_fwhm_left_idx": fwhm_left,
-                       "derivative_fwhm_right_idx": fwhm_right + 1,
-                       "monotonicity": float(np.mean(signed_steps >= -config.threshold_du * noise["sigma_du"])),
-                       "baseline_snr": abs(delta) / max(noise["sigma_udeco"], np.finfo(float).eps)})
+                       "endpoint_source": "threshold", "search_limit": False})
     _split_extrema_overlaps(result, edge_signal, fs=fs, noise=noise, config=config)
     return result
 
@@ -464,11 +485,10 @@ def _split_extrema_overlaps(rows, edge_signal, *, fs, noise, config):
         for k in scan:
             if direction * steps[k] < 0:
                 count += 1
-                if count == 2:
-                    return (k + 1 if side == "left" else k), "overlap_second_reversal", False
+                if count == 3:
+                    return (k + 1 if side == "left" else k), "overlap_third_reversal", False
         return limit, "overlap_search_limit", True
 
-    changed = set()
     for roi_id in dict.fromkeys(row["roi_id"] for row in rows):
         pair = sorted((i for i, row in enumerate(rows)
                        if row["roi_id"] == roi_id
@@ -496,24 +516,18 @@ def _split_extrema_overlaps(rows, edge_signal, *, fs, noise, config):
             first["start_idx"], first["start_rule"], first["search_limit"] = retrace(first, "left")
         if second["end_idx"] <= second["start_idx"]:
             second["end_idx"], second["end_rule"], second["search_limit"] = retrace(second, "right")
-        changed.update(pair)
-    for i in changed:
-        row = rows[i]
+    for row in rows:
         if not row["resolved"]:
             continue
         start, end = row["start_idx"], row["end_idx"]
         if end <= start:
             row.update(resolved=False, reason="invalid_edge_bounds_after_split")
             continue
-        delta = float(edge_signal[end] - edge_signal[start])
-        row.update(delta=delta, amplitude=abs(delta), T_edge=(end-start)/fs,
-                   baseline_snr=abs(delta)/max(noise["sigma_udeco"], np.finfo(float).eps),
-                   monotonicity=float(np.mean(row["direction"] * derivative[start+1:end+1]
-                                              >= -config.threshold_du * noise["sigma_du"])))
+        _measure_resolved_edge(row, edge_signal, fs=fs, noise=noise, config=config)
 
 
 def _fallback_boundary(values: np.ndarray, peak: int, limit: int, step: int) -> tuple[int, str]:
-    """Walk away from a signal peak until a growing or second reverse step."""
+    """Walk away from a signal peak until a growing or third reverse step."""
     edge_point = peak
     original_sign = 0
     previous_size = 0.0
@@ -526,8 +540,8 @@ def _fallback_boundary(values: np.ndarray, peak: int, limit: int, step: int) -> 
             return edge_point, "turn"
         if sign and original_sign and sign != original_sign:
             reverse_count += 1
-            if reverse_count == 2:
-                return edge_point, "second_reversal"
+            if reverse_count == 3:
+                return edge_point, "third_reversal"
         if sign and not original_sign:
             original_sign = sign
         edge_point = point
@@ -540,7 +554,6 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
                                   config: ExperimentConfig) -> list[dict]:
     """Append two peak-centered edges only where extrema lack a localized pair."""
     values = np.asarray(edge_signal, dtype=float)
-    derivative = np.diff(values, prepend=values[0])
     result = list(localized)
     reach = max(1, round(config.extrema_trace_sec * fs))
     for roi in rois:
@@ -556,47 +569,23 @@ def recover_missing_extrema_pairs(edge_signal: np.ndarray, localized: list[dict]
         for side, step, limit in (("left", -1, limits[0]), ("right", 1, limits[1])):
             bound, source = _fallback_boundary(values, peak, limit, step)
             start, end = (bound, peak) if step < 0 else (peak, bound)
-            delta = float(values[end] - values[start])
-            direction = int(np.sign(delta))
             base = {"roi_id": roi["roi_id"], "center_idx": peak,
                     "region_start_idx": start, "region_end_idx": end,
                     "detector_name": "peak_fallback", "fallback_peak_idx": peak,
                     "fallback_side": side, "endpoint_source": source,
                     "search_limit": source == "search_limit",
                     "detector_score": abs(values[peak]) / max(noise["sigma_udeco"], np.finfo(float).eps)}
-            if end <= start or not direction:
-                result.append({**base, "direction": direction, "resolved": False,
-                               "reason": "invalid_fallback_edge", "start_idx": start, "end_idx": end})
-                continue
-            local_derivative = derivative[start + 1:end + 1]
-            relative_peak = int(np.argmax(direction * local_derivative))
-            peak_idx = start + 1 + relative_peak
-            derivative_peak = float(derivative[peak_idx])
-            is_sharp, strong_neighbor_count = _sharp_peak(
-                np.diff(values), peak_idx - 1, direction, config.sharp_neighbor_ratio,
-                noise["sigma_du"], config.sharp_peak_sigma_k)
-            half_peak = abs(derivative_peak) / 2
-            width_left = peak_idx
-            while width_left > start + 1 and direction * derivative[width_left - 1] >= half_peak:
-                width_left -= 1
-            width_right = peak_idx
-            while width_right < end and direction * derivative[width_right + 1] >= half_peak:
-                width_right += 1
-            result.append({**base, "direction": direction, "resolved": True, "reason": None,
-                           "start_idx": start, "end_idx": end, "delta": delta,
-                           "amplitude": abs(delta), "T_edge": (end - start) / fs,
-                           "derivative_peak_idx": peak_idx, "derivative_peak": derivative_peak,
-                           "is_sharp": is_sharp,
-                           "strong_neighbor_count": strong_neighbor_count,
-                           "core_threshold": max(config.threshold_du_general_left * noise["sigma_du"],
-                                                 config.threshold_dupeak_general_left * abs(derivative_peak)),
-                           "normalized_derivative_peak": abs(derivative_peak) / max(noise["sigma_du"], np.finfo(float).eps),
-                           "derivative_peak_width": (width_right - width_left + 1) / fs,
-                           "derivative_fwhm_left_idx": width_left,
-                           "derivative_fwhm_right_idx": width_right,
-                           "monotonicity": float(np.mean(direction * local_derivative
-                                                          >= -config.threshold_du * noise["sigma_du"])),
-                           "baseline_snr": abs(delta) / max(noise["sigma_udeco"], np.finfo(float).eps)})
+            row = {**base, "direction": 0, "resolved": True, "reason": None,
+                   "start_idx": start, "end_idx": end}
+            if end <= start:
+                row.update(resolved=False, reason="invalid_fallback_edge")
+            else:
+                _measure_resolved_edge(row, values, fs=fs, noise=noise, config=config)
+                if row["resolved"]:
+                    row["core_threshold"] = max(
+                        config.threshold_du_general_left * noise["sigma_du"],
+                        config.threshold_dupeak_general_left * abs(row["derivative_peak"]))
+            result.append(row)
     return result
 
 
@@ -611,7 +600,7 @@ def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel
     for item in localized:
         direction = int(item["direction"])
         resolved = bool(item["resolved"])
-        amplitude_pass = resolved and abs(item["delta"]) > config.min_amplitude_sigma_k * sigma_udeco
+        amplitude_pass = resolved and item["delta"] > config.min_amplitude_sigma_k * sigma_udeco
         rows.append({**item, "channel": channel,
                      "is_main_rising": direction > 0, "is_main_falling": direction < 0,
                      "edge_role": ("roi_rising" if direction > 0 else
@@ -621,7 +610,8 @@ def build_direct_event_table(localized: list[dict], rois: list[dict], *, channel
                      "amplitude_pass": bool(amplitude_pass),
                      "classification_status": ("not_main" if amplitude_pass else
                                                "low_amplitude" if resolved else "localization_failed"),
-                     "direction_delta_conflict": bool(resolved and direction * item["delta"] < 0),
+                     "direction_delta_conflict": bool(resolved and item.get("candidate_direction") is not None
+                                                      and int(item["candidate_direction"]) != direction),
                      "morphology": None, "event_label": None, "roi_mode": "cancelled",
                      "derivative_support": (item["derivative_peak_width"] <= config.deriv_peak_width_threshold_sec
                                             and item["normalized_derivative_peak"] >= config.deriv_peak_sigma_k)

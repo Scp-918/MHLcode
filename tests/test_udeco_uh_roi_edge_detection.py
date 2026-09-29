@@ -179,6 +179,34 @@ def test_derivative_extrema_keeps_only_available_direction_without_score_gate():
     assert candidates[0]["detector_score"] < 3.0
 
 
+def test_extrema_entry_uses_strict_ten_sigma_and_either_direction():
+    from udeco_uh_roi_edge_detection import recover_missing_extrema_pairs
+
+    noise = {"sigma_udeco": .5, "sigma_du": 1.0}
+    roi = {"roi_id": "ROI_0", "left_idx": 118, "search_left_idx": 117,
+           "right_idx": 130}
+    for peak, enters in ((10.0, False), (11.0, True)):
+        signal = np.zeros(160)
+        signal[:11] = [0, 1] * 5 + [0]  # Ten alternating differences: sigma_du = 1.
+        signal[120:125] = peak
+        signal[125:] = peak - 3  # Only the rising extremum can exceed 10 sigma.
+        candidates, _ = detect_roi_candidates(
+            signal, [roi], fs=100,
+            config=ExperimentConfig(baseline_sec=.11, extrema_entry_sigma_k=10))
+        rows = localize_roi_candidates(
+            signal, signal, candidates, [roi], fs=100, noise=noise,
+            config=ExperimentConfig(extrema_entry_sigma_k=10))
+        assert all(row.get("extrema_entry_pass") is enters for row in rows)
+        if not enters:
+            assert all(row["reason"] == "below_extrema_entry_threshold" for row in rows)
+            recovered = recover_missing_extrema_pairs(
+                signal, rows, [roi], fs=100, noise=noise,
+                config=ExperimentConfig())
+            assert any(row["detector_name"] == "peak_fallback" for row in recovered)
+        else:
+            assert any(row.get("right_mode") for row in rows)
+
+
 def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
     steps = np.zeros(2200)
     steps[1846:1905] = .0005
@@ -203,13 +231,14 @@ def test_extrema_edge_can_end_far_beyond_roi_search_boundary():
 
 def _direct_edge(roi_id, center, direction, *, delta=None, resolved=True, is_sharp=False):
     row = {"roi_id": roi_id, "center_idx": center, "direction": direction,
+           "candidate_direction": direction,
            "region_start_idx": center, "region_end_idx": center,
            "detector_name": "derivative_extrema", "detector_score": 8.0,
            "resolved": resolved, "reason": None if resolved else "core_does_not_end",
            "is_sharp": is_sharp}
     if resolved:
         row.update(start_idx=center - 1, end_idx=center,
-                   delta=delta, T_edge=0.01,
+                   delta=abs(delta), T_edge=0.01,
                    derivative_peak_width=0.01, normalized_derivative_peak=8.0)
     return row
 
@@ -235,12 +264,13 @@ def test_direct_selection_displays_both_extrema_without_position_pair_gate():
     assert table.classification_status.tolist() == ["roi_missing_pair", "roi_missing_pair"]
 
 
-def test_direct_classification_uses_strict_absolute_delta_and_flags_sign_conflict():
+def test_direct_classification_uses_strict_amplitude_and_flags_direction_conflict():
     rois = [{"roi_id": "ROI_0", "left_idx": 100, "right_idx": 200},
             {"roi_id": "ROI_1", "left_idx": 201, "right_idx": 300}]
-    table = _direct_table([
-        _direct_edge("ROI_0", 150, 1, delta=0.0002),
-        _direct_edge("ROI_1", 250, 1, delta=-0.0003)], rois)
+    first = _direct_edge("ROI_0", 150, 1, delta=0.0002)
+    second = _direct_edge("ROI_1", 250, 1, delta=0.0003)
+    second["candidate_direction"] = -1
+    table = _direct_table([first, second], rois)
     assert table.pair_status.tolist() == ["unpaired", "unpaired"]
     assert table.event_label.tolist() == [None, None]
     assert table.classification_status.tolist() == ["roi_missing_pair", "roi_missing_pair"]
@@ -301,17 +331,19 @@ def test_overlapping_extrema_split_at_quietest_derivative_and_remeasure():
     assert first["end_rule"] == "overlap_split"
     assert first["T_edge"] == .02
     assert first["delta"] == 1
-    assert np.isclose(second["delta"], -.8)
+    assert np.isclose(second["delta"], .8)
+    assert second["direction"] == -1
 
 
-def test_zero_length_overlap_edges_retrace_to_second_reversal():
+def test_zero_length_overlap_edges_retrace_to_third_reversal():
     from udeco_uh_roi_edge_detection import _split_extrema_overlaps
 
     signal = np.zeros(40)
-    signal[17:20] = [.2, .1, 0]
+    signal[16:20] = [.3, .2, .1, 0]
     signal[20:24] = 1
     signal[24:26] = [.2, .3]
     signal[26:] = .4
+    signal[27:] = .5
     rows = [dict(roi_id="ROI_0", detector_name="derivative_extrema", center_idx=20,
                  direction=1, start_idx=21, end_idx=25, resolved=True),
             dict(roi_id="ROI_0", detector_name="derivative_extrema", center_idx=24,
@@ -320,20 +352,29 @@ def test_zero_length_overlap_edges_retrace_to_second_reversal():
                             noise={"sigma_udeco": .01, "sigma_du": .001},
                             config=ExperimentConfig())
     assert rows[0]["end_idx"] == rows[1]["start_idx"] == 21
-    assert rows[0]["start_idx"] == 18
-    assert rows[1]["end_idx"] == 25
-    assert rows[0]["start_rule"] == "overlap_second_reversal"
-    assert rows[1]["end_rule"] == "overlap_second_reversal"
+    assert rows[0]["start_idx"] == 17
+    assert rows[1]["end_idx"] == 26
+    assert rows[0]["start_rule"] == "overlap_third_reversal"
+    assert rows[1]["end_rule"] == "overlap_third_reversal"
     assert all(row["resolved"] for row in rows)
 
 
-def test_fallback_boundary_stops_at_second_reverse_when_old_turn_does_not():
+def test_fallback_boundary_stops_at_third_reverse_when_turn_does_not():
     from udeco_uh_roi_edge_detection import _fallback_boundary
 
     steps = np.zeros(20)
-    steps[10:14] = [-.1, .05, -.1, .05]
+    steps[10:16] = [-.1, .05, -.1, .05, -.1, .05]
     values = np.r_[0, np.cumsum(steps)]
-    assert _fallback_boundary(values, 10, 15, 1) == (13, "second_reversal")
+    assert _fallback_boundary(values, 10, 17, 1) == (15, "third_reversal")
+
+
+def test_fallback_boundary_growing_reverse_still_precedes_third_reverse():
+    from udeco_uh_roi_edge_detection import _fallback_boundary
+
+    steps = np.zeros(20)
+    steps[10:13] = [-.1, .2, -.1]
+    values = np.r_[0, np.cumsum(steps)]
+    assert _fallback_boundary(values, 10, 14, 1) == (11, "turn")
 
 
 def test_roi_mode_uses_rising_shape_and_keeps_falling_shape_diagnostic():
@@ -367,7 +408,7 @@ def test_roi_mode_requires_rising_start_before_falling_start_including_fallback(
     assert table.event_label.tolist() == ["force", "release", "detach", "attach"]
 
 
-def test_delta_uses_edge_signal_endpoints_without_stable_plateaus():
+def test_delta_uses_final_edge_range_and_endpoint_direction_without_plateaus():
     edge = np.zeros(2200)
     edge[1800:1807] = np.arange(1, 8) * .001
     edge[1807:1814] = .007 - np.arange(1, 8) * .001
@@ -380,9 +421,30 @@ def test_delta_uses_edge_signal_endpoints_without_stable_plateaus():
                                    noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=cfg)
     assert len(rows) == 2
     assert all(row["resolved"] for row in rows)
-    assert all(np.isclose(row["delta"], edge[row["end_idx"]] - edge[row["start_idx"]])
+    assert all(np.isclose(row["delta"], np.ptp(edge[row["start_idx"]:row["end_idx"] + 1]))
+               for row in rows)
+    assert all(row["direction"] == np.sign(edge[row["end_idx"]] - edge[row["start_idx"]])
                for row in rows)
     assert all("settle_end_idx" not in row for row in rows)
+
+
+def test_edge_range_amplitude_can_exceed_endpoint_change_and_zero_change_fails():
+    from udeco_uh_roi_edge_detection import _measure_resolved_edge
+
+    signal = np.array([0.0, 2.0, 1.0])
+    row = {"detector_name": "derivative_extrema", "direction": 1,
+           "start_idx": 0, "end_idx": 2, "resolved": True}
+    noise = {"sigma_udeco": .5, "sigma_du": .1}
+    _measure_resolved_edge(row, signal, fs=100, noise=noise, config=ExperimentConfig())
+    assert row["resolved"] and row["direction"] == 1
+    assert row["delta"] == row["amplitude"] == 2.0
+    assert row["endpoint_change"] == 1.0
+    assert row["baseline_snr"] == 4.0
+
+    flat_end = {**row, "end_idx": 2}
+    _measure_resolved_edge(flat_end, np.array([0.0, 2.0, 0.0]), fs=100,
+                           noise=noise, config=ExperimentConfig())
+    assert not flat_end["resolved"] and flat_end["reason"] == "zero_endpoint_change"
 
 
 def test_weak_peak_and_unfinished_edge_keep_failure_reason():
@@ -490,13 +552,14 @@ def test_general_edge_uses_three_low_left_and_four_low_right():
         assert not row["is_sharp"]
 
 
-def test_general_edge_stops_before_second_nonconsecutive_reverse_sample():
+def test_general_edge_stops_before_third_nonconsecutive_reverse_sample():
     steps = np.zeros(30)
-    steps[6:15] = [-.04, .12, -.04, .12, .2, .12, -.04, .12, -.04]
+    steps[5:17] = [-.04, .12, -.04, .12, -.04, .2,
+                   .12, -.04, .12, -.04, .12, -.04]
     row = _extrema_from_steps(steps)
     assert row["resolved"]
-    assert (row["start_idx"], row["end_idx"]) == (7, 14)
-    assert (row["start_rule"], row["end_rule"]) == ("second_reversal", "second_reversal")
+    assert (row["start_idx"], row["end_idx"]) == (6, 16)
+    assert (row["start_rule"], row["end_rule"]) == ("third_reversal", "third_reversal")
 
 
 def test_sharp_left_zero_difference_stops_at_peak_boundary():
@@ -606,7 +669,7 @@ def test_fallback_main_pair_controls_roi_classification():
     assert original_rise.classification_status == "not_main"
     assert original_rise.event_label is None
     assert original_rise.morphology is None
-    fallback[1]["delta"] = -.004
+    fallback[1]["delta"] = .004
     mismatched = _direct_table(original + fallback, rois)
     assert set(mismatched.classification_status) == {"roi_delta_mismatch"}
     assert mismatched.event_label.isna().all()
