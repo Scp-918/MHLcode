@@ -396,7 +396,7 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
             low_run = low_run + 1 if abs(derivative[k]) < threshold_right else 0
             if low_run >= right_quiet_points:
                 first_low_k = k - low_run + 1
-                end_idx = first_low_k if sharp_positive else first_low_k + 1
+                end_idx = first_low_k if sharp_positive else first_low_k + 3
                 end_rule = "threshold"
                 break
         partial = {"start_idx": start_idx, "end_idx": end_idx,

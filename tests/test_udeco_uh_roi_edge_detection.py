@@ -468,7 +468,7 @@ def test_general_edge_uses_three_low_left_and_four_low_right():
     negative = _extrema_from_steps(-steps, direction=-1)
     for row in (positive, negative):
         assert row["resolved"]
-        assert (row["start_idx"], row["end_idx"]) == (8, 13)
+        assert (row["start_idx"], row["end_idx"]) == (8, 15)
         assert (row["threshold_left"], row["threshold_right"]) == (.02, .02)
         assert not row["is_sharp"]
 
