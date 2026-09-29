@@ -39,6 +39,7 @@ class ExperimentConfig:
     edge_score_sigma: float = 3.5
     candidate_merge_sec: float = 0.02
     localize_search_sec: float = 0.20
+    extrema_trace_sec: float = 1.0
     pre_plateau_sec: float = 0.05
     post_plateau_sec: float = 0.05
     plateau_sigma_k: float = 2.5
@@ -470,29 +471,45 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                          key=lambda i: candidates[i]["center_idx"])
         for position, i in enumerate(ordered):
             center = int(candidates[i]["center_idx"])
+            if candidates[i]["detector_name"] == "derivative_extrema":
+                trace_radius = max(radius, round(config.extrema_trace_sec * fs))
+                outer_left = max(0, center - trace_radius - pre_points)
+                outer_right = min(len(clean) - 1, center + trace_radius
+                                  + settle_points + hold_points + post_points)
+            else:
+                outer_left = max(0, roi_by_id[roi_id].get("search_left_idx", roi_by_id[roi_id]["left_idx"])
+                                 - radius - pre_points)
+                outer_right = min(len(clean) - 1, roi_by_id[roi_id]["right_idx"] + radius
+                                  + settle_points + hold_points + post_points)
             left = ((int(candidates[ordered[position-1]]["center_idx"]) + center) // 2
-                    if position else max(0, roi_by_id[roi_id].get("search_left_idx", roi_by_id[roi_id]["left_idx"])
-                                         - radius - pre_points))
+                    if position else outer_left)
             right = ((center + int(candidates[ordered[position+1]]["center_idx"])) // 2
-                     if position + 1 < len(ordered) else
-                     min(len(clean) - 1, roi_by_id[roi_id]["right_idx"] + radius
-                         + settle_points + hold_points + post_points))
+                     if position + 1 < len(ordered) else outer_right)
             neighbor_bounds[i] = (left, right)
     result = []
     for candidate_index, candidate in enumerate(candidates):
         roi = roi_by_id[candidate["roi_id"]]
         search_left, search_right = neighbor_bounds[candidate_index]
-        left = max(0, roi.get("search_left_idx", roi["left_idx"]) - radius - pre_points)
-        right = min(len(clean) - 1, roi["right_idx"] + radius
-                    + settle_points + hold_points + post_points)
         center = int(candidate["center_idx"])
         direction = int(candidate["direction"])
+        if candidate["detector_name"] == "derivative_extrema":
+            trace_radius = max(radius, round(config.extrema_trace_sec * fs))
+            left = max(0, center - trace_radius - pre_points)
+            right = min(len(clean) - 1, center + trace_radius
+                        + settle_points + hold_points + post_points)
+        else:
+            left = max(0, roi.get("search_left_idx", roi["left_idx"]) - radius - pre_points)
+            right = min(len(clean) - 1, roi["right_idx"] + radius
+                        + settle_points + hold_points + post_points)
         lo = max(search_left, center - radius - 1)
         hi = min(search_right - 1, center + radius)
         if hi < lo:
             result.append(_unresolved(candidate, "no_derivative_window"))
             continue
-        peak_k = lo + int(np.argmax(direction * derivative[lo:hi+1]))
+        # Extrema discovery already fixed the derivative peak inside the ROI.
+        # Do not move its anchor to a stronger transition outside that ROI.
+        peak_k = (center - 1 if candidate["detector_name"] == "derivative_extrema"
+                  else lo + int(np.argmax(direction * derivative[lo:hi+1])))
         peak = float(derivative[peak_k])
         if direction * peak < config.deriv_sigma_k * noise["sigma_du"]:
             result.append(_unresolved(candidate, "weak_derivative",
@@ -573,7 +590,63 @@ def localize_roi_candidates(clean: np.ndarray, edge_signal: np.ndarray,
                        "derivative_fwhm_right_idx": fwhm_right + 1,
                        "monotonicity": float(np.mean(signed_core_steps >= -config.deriv_sigma_k * noise["sigma_du"])),
                        "baseline_snr": abs(delta) / max(noise["sigma_udeco"], np.finfo(float).eps)})
+    _split_extrema_overlaps(result, clean, edge_signal, fs=fs, noise=noise, config=config)
     return result
+
+
+def _split_extrema_overlaps(rows, clean, edge_signal, *, fs, noise, config):
+    """Split overlapping opposite extrema within each ROI, then remeasure.
+
+    The shared split sample is the quietest derivative between the anchors.
+    A forced boundary is recorded explicitly; it is not proof of settling.
+    """
+    derivative = np.diff(edge_signal, prepend=edge_signal[0])
+    changed = set()
+    for roi_id in dict.fromkeys(row["roi_id"] for row in rows):
+        pair = sorted((i for i, row in enumerate(rows)
+                       if row["roi_id"] == roi_id
+                       and row["detector_name"] == "derivative_extrema"),
+                      key=lambda i: rows[i]["center_idx"])
+        if len(pair) != 2:
+            continue
+        i, j = pair
+        first, second = rows[i], rows[j]
+        end = first.get("settle_end_idx")
+        start = second.get("start_idx")
+        if end is None or start is None or end < start:
+            continue
+        lo, hi = first["center_idx"] + 1, second["center_idx"]
+        if lo >= hi:
+            continue
+        split = lo + int(np.argmin(np.abs(derivative[lo:hi])))
+        for row in (first, second):
+            row["overlap_split_idx"] = split
+        first["settle_end_idx"] = min(end, split)
+        if first.get("core_end_idx") is not None:
+            first["core_end_idx"] = min(first["core_end_idx"], split)
+        second["start_idx"] = max(start, split)
+        changed.update(pair)
+    pre_n = max(1, round(config.pre_plateau_sec * fs))
+    post_n = max(1, round(config.post_plateau_sec * fs))
+    for i in changed:
+        row = rows[i]
+        if not row["resolved"]:
+            continue
+        start, core, end = (row[k] for k in ("start_idx", "core_end_idx", "settle_end_idx"))
+        pre = clean[max(0, start-pre_n+1):start+1]
+        post = clean[end+1:end+1+post_n]
+        pre_level, post_level = float(np.median(pre)), float(np.median(post))
+        delta = post_level - pre_level
+        row.update(pre_level=pre_level, post_level=post_level, delta=delta,
+                   amplitude=abs(delta), T_core=(core-start)/fs, T_tail=(end-core)/fs,
+                   baseline_snr=abs(delta)/max(noise["sigma_udeco"], np.finfo(float).eps),
+                   monotonicity=float(np.mean(row["direction"] * derivative[start+1:core+1]
+                                              >= -config.deriv_sigma_k * noise["sigma_du"])))
+        for values, level, reason in ((pre, pre_level, "unstable_pre_plateau_after_split"),
+                                      (post, post_level, "unstable_post_plateau_after_split")):
+            if np.median(np.abs(values-level)) > config.plateau_sigma_k * noise["sigma_udeco"]:
+                row.update(resolved=False, reason=reason)
+                break
 
 
 def build_event_table(localized: list[dict], rois: list[dict], *, channel: str,

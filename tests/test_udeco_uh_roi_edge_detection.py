@@ -263,6 +263,29 @@ def test_localization_can_finish_beyond_logical_roi_right_boundary():
     assert measured["settle_end_idx"] > roi["right_idx"]
 
 
+def test_extrema_edge_can_settle_far_beyond_roi_search_boundary():
+    signal = np.zeros(2200)
+    signal[1849] = 0.002
+    signal[1850:1906] = 0.002 + np.arange(1, 57) * 0.0005
+    signal[1906:] = signal[1905]
+    roi = {"roi_id": "ROI_0", "left_idx": 1800,
+           "search_left_idx": 1797, "right_idx": 1850}
+    candidates, _ = detect_roi_candidates(
+        signal, [roi], fs=100,
+        config=ExperimentConfig(edge_detector="derivative_extrema"))
+    rising = next(row for row in candidates if row["direction"] == 1)
+    measured = localize_roi_candidates(
+        signal, signal, [rising], [roi], fs=100,
+        noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4},
+        config=ExperimentConfig())[0]
+    assert rising["center_idx"] == 1849
+    assert measured["resolved"]
+    assert measured["start_idx"] == 1848
+    assert measured["core_end_idx"] > roi["right_idx"] + 20
+    assert measured["settle_end_idx"] >= measured["core_end_idx"]
+    assert np.isclose(measured["core_threshold"], 0.0004)
+
+
 def test_localization_can_start_before_left_search_boundary():
     signal = np.zeros(2200)
     signal[1794:1802] = np.arange(1, 9) * 0.001
@@ -433,3 +456,35 @@ def test_nearby_candidate_centers_localize_distinct_steps():
     assert measured[1]["resolved"]
     assert measured[1]["derivative_peak_idx"] == 1810
     assert np.isclose(measured[1]["delta"], 0.02)
+
+
+def test_extrema_localization_keeps_roi_anchor_when_stronger_peak_is_outside():
+    signal = np.zeros(2200)
+    signal[1800:] = .01
+    signal[1810:] += .02
+    roi = {"roi_id": "ROI_0", "left_idx": 1798, "search_left_idx": 1797, "right_idx": 1801}
+    cfg = ExperimentConfig(edge_detector="derivative_extrema")
+    candidates, _ = detect_roi_candidates(signal, [roi], fs=100, config=cfg)
+    measured = localize_roi_candidates(signal, signal, candidates, [roi], fs=100,
+                                       noise={"sigma_udeco": 1e-4, "sigma_du": 1e-4}, config=cfg)[0]
+    assert measured["derivative_peak_idx"] == 1800
+    assert np.isclose(measured["core_threshold"], .002)
+
+
+def test_overlapping_extrema_split_at_quietest_derivative_and_remeasure():
+    from udeco_uh_roi_edge_detection import _split_extrema_overlaps
+    signal = np.zeros(100)
+    signal[20:41] = 1
+    signal[41:] = .2
+    rows = [dict(roi_id="ROI_0", detector_name="derivative_extrema", center_idx=20,
+                 direction=1, start_idx=19, core_end_idx=20, settle_end_idx=45, resolved=True),
+            dict(roi_id="ROI_0", detector_name="derivative_extrema", center_idx=41,
+                 direction=-1, start_idx=35, core_end_idx=41, settle_end_idx=42, resolved=True)]
+    _split_extrema_overlaps(rows, signal, signal, fs=100,
+                            noise={"sigma_udeco": .01, "sigma_du": .001}, config=ExperimentConfig())
+    first, second = rows
+    assert first["overlap_split_idx"] == second["overlap_split_idx"] == 21
+    assert first["settle_end_idx"] <= second["start_idx"]
+    assert first["T_tail"] == .01
+    assert first["delta"] == 1
+    assert np.isclose(second["delta"], -.8)
