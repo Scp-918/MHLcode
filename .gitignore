@@ -7,3 +7,5 @@ __pycache__/
 .worktrees/
 outputs/
 *.pyc
+tmp/
+figures/assets/
