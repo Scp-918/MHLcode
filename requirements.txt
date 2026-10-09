@@ -4,7 +4,6 @@ scipy>=1.15,<2
 matplotlib>=3.10,<4
 plotly>=6.6,<7
 statsmodels>=0.14.6,<0.15
-scikit-learn>=1.7,<2
 openpyxl>=3.1,<4
 jupyterlab>=4.5,<5
 ipympl>=0.9,<1
